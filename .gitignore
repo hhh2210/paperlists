@@ -38,3 +38,11 @@ Thumbs.db
 filtered_results-*.json 
 
 *.csv
+
+# Paperlists query-api artifacts (built locally, never committed)
+papers.db
+papers.db-wal
+papers.db-shm
+tools/query-api/papers.db*
+tools/query-api/.venv/
+tools/mcp-server/.venv/

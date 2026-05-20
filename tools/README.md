@@ -1,4 +1,17 @@
-# Paper Search Tool
+# Paperlists Tools
+
+Three complementary entry points for working with the paperlists corpus:
+
+| Directory | What it is | When to use |
+|---|---|---|
+| `app.py` / `extract.py` | Streamlit web UI + CLI (original tools) | You want to manually browse the corpus on your laptop |
+| [`query-api/`](query-api/) | Hosted FastAPI service backed by sqlite FTS5 | You're deploying the service (Railway/HF Spaces) or want a local HTTP layer |
+| [`mcp-server/`](mcp-server/) | MCP server for Claude Code / Cursor / Codex / Claude Desktop / any MCP host | You want AI agents to query the corpus directly |
+| [`skill/`](skill/) | Cross-tool Skill (`.md` + bundled CLI script) | You want zero-install access from any LLM that loads skills |
+
+The MCP server and Skill both default to the hosted API, so end users don't need to download the ~830MB of raw JSON. Set `PAPERLISTS_API_URL` to point at a self-hosted instance.
+
+# Paper Search Tool (legacy / local Streamlit)
 
 A Streamlit-based tool for efficiently searching and analyzing conference papers locally. 
 ## Why This Tool?

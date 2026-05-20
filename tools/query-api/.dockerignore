@@ -1,0 +1,12 @@
+**/__pycache__
+**/*.pyc
+.git
+.gitignore
+tools/img
+tools/mcp-server
+tools/skill
+tools/PR_MESSAGE.md
+tools/app.py
+*.db
+*.db-wal
+*.db-shm
