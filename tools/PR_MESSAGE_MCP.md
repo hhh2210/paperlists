@@ -76,25 +76,37 @@ the user asks evolution-shaped questions.
 
 ## What I've already verified (locally)
 
-- Index builds in **~30s** from the 293 JSON files; final DB **~578 MB**.
-- 218k papers (after `(conf, year, paper_id)` dedup) indexed across 30 conferences.
+- Index builds successfully from the current JSON corpus; the Railway build
+  indexed **237,735 papers** from **292 files** into a **~623 MB** sqlite DB.
 - All endpoints return real, well-shaped data. A couple of examples:
   - `topic_trend("diffusion model", 2018, 2024)` → 17 → 17 → 22 → 58 → 131 → **739** → **2401** papers/year (matches the well-known explosion).
   - `topic_evolution("in-context learning", 2020, 2024, window=2)` → top keywords drift from `deep learning / reinforcement learning` (2020-21) to `in-context learning / large language models` (2022+); venue mix shifts ICLR/NeurIPS → +EMNLP.
   - `compare_periods("vision transformer", 2018-2020 vs 2022-2024)` → 111 → 2112 papers; `vision transformer` itself surfaces as the dominant emerged keyword.
   - `author_trajectory("Yann LeCun", year_from=2018)` → 91 papers across years with correct landmark works.
-- Sqlite FTS5 query sanitization handles hyphens and special chars (e.g. `"in-context learning"` works without breaking FTS syntax).
-- Rate limiter (token bucket, default 60 req/min/IP) tested with a burst.
+- Sqlite FTS5 defaults are safe: ordinary queries are tokenized/quoted, while
+  `raw=true` explicitly opts into full FTS5 syntax and returns HTTP 400 for
+  malformed expressions.
+- Production keeps **4 Uvicorn workers**. Rate-limit state is sqlite-backed in
+  a separate writable DB, so all workers share one bucket per IP.
+- Regression suite: **32 tests passing**, plus live smoke tests against the
+  Railway demo.
 
 ## Deployment plan (egress + sustainability)
 
 Two things to flag honestly:
 
-**Hosting**: I'll deploy a demo to **Railway** under my account (env-var-driven; nothing repo-private). The MCP/Skill default to that URL but anyone can point at their own instance via `PAPERLISTS_API_URL`. If you'd rather it live on `papercopilot` infra (Railway, HF Spaces under `papercopilot` org, your own server), I'm happy to hand it over or co-administer — no strings attached.
+**Hosting**: A live Railway demo is running at
+`https://api-production-18d3.up.railway.app` under my account
+(env-var-driven; nothing repo-private). The MCP/Skill default to that URL but
+anyone can point at their own instance via `PAPERLISTS_API_URL`. If you'd rather
+it live on `papercopilot` infra (Railway, HF Spaces under `papercopilot` org,
+your own server), I'm happy to hand it over or co-administer — no strings attached.
 
 **Egress / cost control**:
 - `include_abstract` defaults to `false` on `/v1/search`; abstracts only go out through `/v1/paper/{conf}/{id}` (one-at-a-time).
-- Token-bucket rate limiter at 60 req/min/IP (configurable).
+- Cross-worker token-bucket rate limiter at 60 req/min/IP (configurable),
+  stored in a separate sqlite WAL DB so multi-worker deployments do not multiply
+  the effective limit.
 - If traffic grows beyond the free tier, the same Dockerfile redeploys to **Cloudflare Workers + D1** (near-zero idle cost) or **HF Spaces** (free, ML-community-native). No code changes required, only the DB driver.
 
 ## What's intentionally NOT in this PR
@@ -107,9 +119,10 @@ Two things to flag honestly:
 ## What I'm asking before merge
 
 1. **Location**: is `tools/{query-api,mcp-server,skill}/` the right home, or
-   would you prefer a separate repo under `papercopilot/`? (e.g.
-   `papercopilot/paperlists-mcp`)
-2. **Naming**: `paperlists-mcp` vs `papercopilot-mcp` — your call.
+   would you prefer a separate repo under `papercopilot/`? I think
+   `papercopilot/paperlists-agent` is the cleanest fit if we split it out.
+2. **Naming**: `paperlists-agent` vs `paperlists-mcp` vs
+   `papercopilot-mcp` — your call.
 3. **Hosting ownership**: happy to host the demo myself for v1; happy to
    hand it to you once it stabilizes. Whichever you prefer.
 4. **API surface**: anything missing? `aff_*` fields are the obvious one I
