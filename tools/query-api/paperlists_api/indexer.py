@@ -8,7 +8,7 @@ The repo root is expected to contain conference subdirectories
 from __future__ import annotations
 
 import json
-import os
+import hashlib
 import re
 import sqlite3
 import sys
@@ -16,16 +16,19 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import orjson
+except ImportError:  # pragma: no cover - stdlib fallback for minimal installs
+    orjson = None
+
 FILENAME_RE = re.compile(r"^([a-z0-9]+?)(\d{4})\.json$")
 
-# Directories under repo root that hold paperlist JSON files.
-# Anything else (tools/, .git/, etc.) is ignored.
-KNOWN_CONF_DIRS = {
-    "3dv", "aaai", "acl", "acml", "aistats", "alt", "automl", "coling",
-    "colm", "colt", "corl", "cvpr", "eccv", "emnlp", "iccv", "iclr",
-    "icml", "icra", "ijcai", "iros", "kdd", "naacl", "nips", "rss",
-    "siggraph", "siggraphasia", "uai", "wacv", "www", "ai4x",
-}
+IGNORED_TOP_LEVEL_DIRS = {".git", ".github", "tools", "__pycache__"}
+# Ordered from most-stable to least-stable. `site` and `pdf` are URLs that some
+# source files reuse across distinct papers (e.g. siggraph2025.json repeats the
+# same `id` for 4-5 paper rows); we still try them, but ingest_file applies a
+# within-file dedup safety net so collisions don't silently drop papers.
+ID_FIELDS = ("id", "doi", "arxiv", "openreview", "url_paper", "site", "pdf")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -33,6 +36,8 @@ CREATE TABLE IF NOT EXISTS papers (
     conf         TEXT NOT NULL,
     year         INTEGER NOT NULL,
     paper_id     TEXT,
+    source_path  TEXT,
+    source_index INTEGER,
     title        TEXT NOT NULL,
     abstract     TEXT,
     keywords     TEXT,
@@ -130,13 +135,48 @@ def _norm_str(v) -> str:
     return str(v).strip()
 
 
+def _load_json(fp: Path):
+    if orjson is not None:
+        return orjson.loads(fp.read_bytes())
+    with fp.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _paper_id(rec: dict, conf: str, year: int, source_index: int) -> str:
+    return _paper_id_candidates(rec, conf, year, source_index)[0]
+
+
+def _paper_id_candidates(rec: dict, conf: str, year: int, source_index: int) -> list[str]:
+    candidates: list[str] = []
+    for field in ID_FIELDS:
+        value = _norm_str(rec.get(field))
+        if value:
+            candidates.append(value)
+    title = _norm_str(rec.get("title"))
+    authors = _norm_str(rec.get("author") or rec.get("author_site"))
+    digest = hashlib.sha1(
+        f"{conf}|{year}|{source_index}|{title}|{authors}".encode("utf-8")
+    ).hexdigest()
+    candidates.append(f"generated:{digest[:16]}")
+    return candidates
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
+    if "source_path" not in columns:
+        conn.execute("ALTER TABLE papers ADD COLUMN source_path TEXT")
+    if "source_index" not in columns:
+        conn.execute("ALTER TABLE papers ADD COLUMN source_index INTEGER")
+
+
 def discover_files(repo_root: Path) -> list[tuple[str, int, Path]]:
     """Return list of (conf, year, path) for every conference JSON file."""
     out: list[tuple[str, int, Path]] = []
     for conf_dir in sorted(repo_root.iterdir()):
         if not conf_dir.is_dir():
             continue
-        if conf_dir.name not in KNOWN_CONF_DIRS:
+        if conf_dir.name.startswith(".") or conf_dir.name in IGNORED_TOP_LEVEL_DIRS:
             continue
         for fp in sorted(conf_dir.iterdir()):
             m = FILENAME_RE.match(fp.name)
@@ -147,27 +187,46 @@ def discover_files(repo_root: Path) -> list[tuple[str, int, Path]]:
     return out
 
 
-def iter_records(fp: Path) -> Iterable[dict]:
-    with fp.open() as f:
-        data = json.load(f)
+def iter_records(fp: Path) -> Iterable[tuple[int, dict]]:
+    data = _load_json(fp)
     if isinstance(data, list):
-        yield from data
+        for idx, rec in enumerate(data):
+            if isinstance(rec, dict):
+                yield idx, rec
     elif isinstance(data, dict):
-        yield data
+        yield 0, data
 
 
-def ingest_file(conn: sqlite3.Connection, conf: str, year: int, fp: Path) -> int:
+def ingest_file(conn: sqlite3.Connection, conf: str, year: int, fp: Path, source_path: str) -> int:
     cur = conn.cursor()
     cur.execute("DELETE FROM papers WHERE conf=? AND year=?", (conf, year))
     rows = []
-    for rec in iter_records(fp):
+    seen_ids: set[str] = set()
+    dedup_collisions = 0
+    for source_index, rec in iter_records(fp):
         title = _norm_str(rec.get("title"))
         if not title:
             continue
+        pid_candidates = _paper_id_candidates(rec, conf, year, source_index)
+        pid = next((candidate for candidate in pid_candidates if candidate not in seen_ids), pid_candidates[-1])
+        # Within-file dedup safety net: a few source files (e.g. siggraph2025.json)
+        # reuse the same `id` for 4-5 distinct paper rows. Without this, the
+        # UNIQUE(conf, year, paper_id) constraint + INSERT OR IGNORE would
+        # silently drop ~300 SIGGRAPH papers and similar across other venues.
+        if pid in seen_ids:
+            authors = _norm_str(rec.get("author") or rec.get("author_site"))
+            digest = hashlib.sha1(
+                f"{conf}|{year}|{source_index}|{title}|{authors}".encode("utf-8")
+            ).hexdigest()
+            pid = f"dedup:{digest[:16]}"
+            dedup_collisions += 1
+        seen_ids.add(pid)
         rows.append((
             conf,
             year,
-            _norm_str(rec.get("id")),
+            pid,
+            source_path,
+            source_index,
             title,
             _norm_str(rec.get("abstract")),
             _norm_str(rec.get("keywords")),
@@ -186,14 +245,30 @@ def ingest_file(conn: sqlite3.Connection, conf: str, year: int, fp: Path) -> int
     cur.executemany(
         """
         INSERT OR IGNORE INTO papers
-        (conf, year, paper_id, title, abstract, keywords, authors,
+        (conf, year, paper_id, source_path, source_index, title, abstract, keywords, authors,
          affiliations, primary_area, status, track, site, openreview, pdf,
          rating_avg, confidence_avg, gs_citation)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows,
     )
-    return len(rows)
+    inserted = conn.execute(
+        "SELECT COUNT(*) AS n FROM papers WHERE conf=? AND year=?", (conf, year)
+    ).fetchone()[0]
+    dropped = len(rows) - inserted
+    if dropped > 0:
+        # Should be impossible after the within-file dedup, but flag loudly if
+        # the constraint still fires (e.g. a future schema change).
+        print(
+            f"  WARN {source_path}: {dropped} rows hit UNIQUE constraint after dedup",
+            file=sys.stderr,
+        )
+    if dedup_collisions > 0:
+        print(
+            f"  note {source_path}: rekeyed {dedup_collisions} colliding paper_id(s)",
+            file=sys.stderr,
+        )
+    return inserted
 
 
 def build_index(repo_root: Path, db_path: Path, *, force: bool = False) -> dict:
@@ -203,7 +278,7 @@ def build_index(repo_root: Path, db_path: Path, *, force: bool = False) -> dict:
 
     conn = sqlite3.connect(db_path)
     conn.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-    conn.executescript(SCHEMA)
+    ensure_schema(conn)
     conn.executescript(TRIGGERS)
 
     files = discover_files(repo_root)
@@ -217,7 +292,7 @@ def build_index(repo_root: Path, db_path: Path, *, force: bool = False) -> dict:
         if not force and rel in existing and abs(existing[rel][0] - mtime) < 1e-6:
             stats["skipped"] += 1
             continue
-        n = ingest_file(conn, conf, year, fp)
+        n = ingest_file(conn, conf, year, fp, rel)
         conn.execute(
             "INSERT OR REPLACE INTO source_files(path, mtime, rows, indexed_at) VALUES (?,?,?,?)",
             (rel, mtime, n, time.time()),
@@ -230,6 +305,7 @@ def build_index(repo_root: Path, db_path: Path, *, force: bool = False) -> dict:
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('built_at', ?)", (str(time.time()),))
     conn.commit()
     conn.execute("ANALYZE")
+    conn.execute("PRAGMA optimize")
     conn.close()
     stats["elapsed_sec"] = round(time.time() - t0, 2)
     return stats

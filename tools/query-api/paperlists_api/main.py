@@ -10,15 +10,15 @@ keyword search is already well served by papercopilot.com.
 from __future__ import annotations
 
 import os
-import time
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import __version__, queries
+from . import __version__, queries, ratelimit
 from .db import DB_PATH, connect
+from .queries import FTSQueryError
 
 API_TITLE = "Paperlists Query API"
 DEFAULT_LIMIT = 50
@@ -42,17 +42,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Tiny in-memory rate limiter ----------
-# Hosted demo on Railway free tier — protect egress. Per-IP token bucket.
-_RATE_BUCKET: dict[str, tuple[float, float]] = {}
-_RATE_PER_MIN = float(os.environ.get("PAPERLISTS_RATE_PER_MIN", "60"))
-_RATE_BURST = float(os.environ.get("PAPERLISTS_RATE_BURST", "20"))
+
+@app.exception_handler(FTSQueryError)
+async def _fts_query_error_handler(request: Request, exc: FTSQueryError):
+    return JSONResponse(
+        {"error": "invalid_query", "detail": str(exc)},
+        status_code=400,
+    )
+
+# ---------- Cross-worker rate limiter ----------
+# Backed by a tiny sqlite file (see paperlists_api/ratelimit.py). All
+# uvicorn workers see the same bucket for the same IP, so the per-IP quota
+# survives a 4-worker Railway deployment. Single-worker setups work too —
+# the sqlite file is just an in-process map at that point.
+#
+# Trust-proxy resolution:
+#   "1"/"true"/"yes"   → always trust X-Forwarded-For
+#   "0"/"false"/"no"   → never trust XFF
+#   "auto" (default)   → trust if we detect a known trusted-proxy host
+#                        (Railway, HF Spaces). Avoids the failure mode where
+#                        all users collapse into one bucket because the
+#                        operator forgot to set PAPERLISTS_TRUST_PROXY=1 on
+#                        a Railway deploy.
+_TRUST_PROXY_ENV = os.environ.get("PAPERLISTS_TRUST_PROXY", "auto").lower()
+# Heuristic: these env vars are auto-injected by the platform's edge proxy.
+# If any is present we are behind that platform's proxy and XFF is
+# trustworthy. Operators on platforms NOT in this list MUST set
+# PAPERLISTS_TRUST_PROXY=1 explicitly — otherwise every visitor will share
+# one rate-limit bucket because req.client.host is the proxy's address.
+_PLATFORM_PROXY_MARKERS = (
+    "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID",    # Railway
+    "SPACE_ID",                                       # HuggingFace Spaces
+    "FLY_APP_NAME",                                   # Fly.io
+    "RENDER",                                         # Render
+    "VERCEL",                                         # Vercel
+    "K_SERVICE", "K_REVISION",                        # Google Cloud Run / Knative
+    "WEBSITE_SITE_NAME",                              # Azure App Service
+)
+_DETECTED_PROXY_NAME = next(
+    (name for name in _PLATFORM_PROXY_MARKERS if os.environ.get(name)), None
+)
+if _TRUST_PROXY_ENV in ("1", "true", "yes"):
+    _TRUST_PROXY = True
+elif _TRUST_PROXY_ENV in ("0", "false", "no"):
+    _TRUST_PROXY = False
+else:  # "auto" (default) or anything unrecognized
+    _TRUST_PROXY = bool(_DETECTED_PROXY_NAME)
 
 
 def _client_ip(req: Request) -> str:
-    fwd = req.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Return the IP to bucket against.
+
+    Critical: this MUST NOT trust user-supplied X-Forwarded-For unless we
+    know we're behind a proxy that overwrites it. Uvicorn is started
+    without `--forwarded-allow-ips=*`, so its default (trust 127.0.0.1
+    only) keeps `req.client.host` honest. When `_TRUST_PROXY` is set
+    (explicitly via env or auto-detected from a platform marker), we read
+    XFF and take the left-most entry as the original client.
+    """
+    if _TRUST_PROXY:
+        fwd = req.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip() or "unknown"
     return req.client.host if req.client else "unknown"
 
 
@@ -61,15 +112,13 @@ async def rate_limit(request: Request, call_next):
     if request.url.path in ("/", "/healthz", "/v1/coverage"):
         return await call_next(request)
     ip = _client_ip(request)
-    now = time.time()
-    tokens, last = _RATE_BUCKET.get(ip, (_RATE_BURST, now))
-    tokens = min(_RATE_BURST, tokens + (now - last) * (_RATE_PER_MIN / 60.0))
-    if tokens < 1.0:
+    allowed, retry = ratelimit.check_and_consume(ip)
+    if not allowed:
         return JSONResponse(
-            {"error": "rate_limited", "retry_after_sec": int((1.0 - tokens) * 60.0 / _RATE_PER_MIN)},
+            {"error": "rate_limited", "retry_after_sec": retry},
             status_code=429,
+            headers={"Retry-After": str(retry)},
         )
-    _RATE_BUCKET[ip] = (tokens - 1.0, now)
     return await call_next(request)
 
 
@@ -109,9 +158,17 @@ def coverage():
         return queries.coverage(conn)
 
 
+_RAW_DESC = (
+    "If true, pass the query string to FTS5 verbatim — enables operators "
+    "(`foo OR bar`, `\"exact phrase\"`, `title:diffusion`, `reason*`) at "
+    "the cost of HTTP 400 on syntax errors. Default false: input is "
+    "split into terms and AND'd, safe for any user input."
+)
+
+
 @app.get("/v1/search")
 def search(
-    q: str = Query(..., min_length=1, max_length=200, description="Query string. FTS5 syntax accepted."),
+    q: str = Query(..., min_length=1, max_length=200, description="Query string. By default input is treated as AND'd terms; set raw=true for full FTS5 syntax."),
     conferences: Optional[str] = Query(None, description="Comma-separated conf list, e.g. 'iclr,nips,icml'."),
     year_from: Optional[int] = Query(None, ge=1990, le=2100),
     year_to: Optional[int] = Query(None, ge=1990, le=2100),
@@ -120,6 +177,7 @@ def search(
     offset: int = Query(0, ge=0),
     order_by: str = Query("relevance", pattern="^(relevance|year_desc|citation_desc|rating_desc)$"),
     include_abstract: bool = Query(False, description="Include abstract in each result. Off by default to control egress."),
+    raw: bool = Query(False, description=_RAW_DESC),
 ):
     confs = [c.strip().lower() for c in conferences.split(",")] if conferences else None
     with connect() as conn:
@@ -130,10 +188,11 @@ def search(
             exclude_rejected=exclude_rejected,
             limit=limit, offset=offset, order_by=order_by,
             include_abstract=include_abstract,
+            raw=raw,
         )
 
 
-@app.get("/v1/paper/{conf}/{paper_id}")
+@app.get("/v1/paper/{conf}/{paper_id:path}")
 def get_paper(conf: str, paper_id: str):
     with connect() as conn:
         paper = queries.get_paper(conn, conf, paper_id)
@@ -149,13 +208,14 @@ def topic_trend(
     year_from: Optional[int] = Query(None),
     year_to: Optional[int] = Query(None),
     exclude_rejected: bool = Query(True),
+    raw: bool = Query(False, description=_RAW_DESC),
 ):
     confs = [c.strip().lower() for c in conferences.split(",")] if conferences else None
     with connect() as conn:
         return queries.topic_trend(
             conn, q=q, conferences=confs,
             year_from=year_from, year_to=year_to,
-            exclude_rejected=exclude_rejected,
+            exclude_rejected=exclude_rejected, raw=raw,
         )
 
 
@@ -167,12 +227,15 @@ def topic_evolution(
     window: int = Query(1, ge=1, le=5),
     top_k: int = Query(15, ge=1, le=50),
     conferences: Optional[str] = Query(None),
+    exclude_rejected: bool = Query(True),
+    raw: bool = Query(False, description=_RAW_DESC),
 ):
     confs = [c.strip().lower() for c in conferences.split(",")] if conferences else None
     with connect() as conn:
         return queries.topic_evolution(
             conn, q=q, year_from=year_from, year_to=year_to,
             window=window, top_k=top_k, conferences=confs,
+            exclude_rejected=exclude_rejected, raw=raw,
         )
 
 
@@ -193,9 +256,17 @@ def field_landscape(
     q: str = Query(..., min_length=1, max_length=200),
     year: int = Query(..., ge=1990, le=2100),
     top_k: int = Query(10, ge=1, le=50),
+    conferences: Optional[str] = Query(None),
+    exclude_rejected: bool = Query(True),
+    raw: bool = Query(False, description=_RAW_DESC),
 ):
+    confs = [c.strip().lower() for c in conferences.split(",")] if conferences else None
     with connect() as conn:
-        return queries.field_landscape(conn, q=q, year=year, top_k=top_k)
+        return queries.field_landscape(
+            conn, q=q, year=year, top_k=top_k,
+            conferences=confs, exclude_rejected=exclude_rejected,
+            raw=raw,
+        )
 
 
 @app.get("/v1/compare_periods")
@@ -206,13 +277,20 @@ def compare_periods(
     period_b_from: int = Query(..., ge=1990, le=2100),
     period_b_to: int = Query(..., ge=1990, le=2100),
     top_k: int = Query(15, ge=1, le=50),
+    conferences: Optional[str] = Query(None),
+    exclude_rejected: bool = Query(True),
+    raw: bool = Query(False, description=_RAW_DESC),
 ):
+    confs = [c.strip().lower() for c in conferences.split(",")] if conferences else None
     with connect() as conn:
         return queries.compare_periods(
             conn, q=q,
             period_a=(period_a_from, period_a_to),
             period_b=(period_b_from, period_b_to),
             top_k=top_k,
+            conferences=confs,
+            exclude_rejected=exclude_rejected,
+            raw=raw,
         )
 
 
@@ -227,6 +305,10 @@ def top_papers(
     conf: str, year: int,
     by: str = Query("gs_citation", pattern="^(gs_citation|rating|rating_avg)$"),
     top_k: int = Query(20, ge=1, le=100),
+    exclude_rejected: bool = Query(True, description="Exclude Reject/Withdraw/Desk Reject from the ranking. Set False to inspect raw rejects for OpenReview venues."),
 ):
     with connect() as conn:
-        return queries.top_papers(conn, conf=conf, year=year, by=by, top_k=top_k)
+        return queries.top_papers(
+            conn, conf=conf, year=year, by=by,
+            top_k=top_k, exclude_rejected=exclude_rejected,
+        )

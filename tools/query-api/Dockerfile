@@ -2,21 +2,36 @@
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
+ARG PAPERLISTS_DATA_REF=main
 RUN pip install --no-cache-dir orjson
 
-# Build context is the repo root (set in railway.json).
-# Copy only what we need to keep image small.
-COPY tools/query-api/paperlists_api ./paperlists_api
-COPY 3dv aaai acl acml aistats alt automl coling colm colt corl cvpr \
-     eccv emnlp iccv iclr icml icra ijcai iros kdd naacl nips rss \
-     siggraph siggraphasia uai wacv www \
-     /data/
+COPY paperlists_api ./paperlists_api
 
-# ai4x is optional / future; tolerate it being absent.
-RUN if [ -d /data/ai4x ]; then echo "ai4x present"; fi
+# Railway CLI uploads only this tools/query-api directory. Fetch the paperlists
+# JSON corpus inside the builder to avoid sending hundreds of MB through the
+# deployment upload path.
+RUN python - <<'PY' "$PAPERLISTS_DATA_REF"
+import sys
+import tarfile
+import urllib.request
+from pathlib import Path
+
+ref = sys.argv[1]
+archive = Path("/tmp/paperlists.tar.gz")
+url = f"https://github.com/papercopilot/paperlists/archive/refs/heads/{ref}.tar.gz"
+urllib.request.urlretrieve(url, archive)
+with tarfile.open(archive, "r:gz") as tar:
+    tar.extractall("/tmp")
+src = next(Path("/tmp").glob("paperlists-*"))
+for child in src.iterdir():
+    if child.is_dir() and not child.name.startswith(".") and child.name != "tools":
+        target = Path("/data") / child.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        child.rename(target)
+PY
 
 RUN python -m paperlists_api.indexer /data /build/papers.db && \
-    sqlite3 /build/papers.db "VACUUM;" 2>/dev/null || true && \
+    python -c "import sqlite3; c=sqlite3.connect('/build/papers.db'); c.execute('VACUUM'); c.close()" && \
     ls -lh /build/papers.db
 
 # --- Stage 2: lean runtime ---
@@ -24,10 +39,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
-    PAPERLISTS_DB=/app/papers.db
+    PAPERLISTS_DB=/app/papers.db \
+    PAPERLISTS_DB_IMMUTABLE=1 \
+    PAPERLISTS_DB_CACHE_KIB=65536 \
+    PAPERLISTS_DB_MMAP_BYTES=536870912 \
+    WEB_CONCURRENCY=4
 
-COPY tools/query-api/pyproject.toml ./pyproject.toml
-COPY tools/query-api/paperlists_api ./paperlists_api
+COPY pyproject.toml ./pyproject.toml
+COPY paperlists_api ./paperlists_api
 RUN pip install --no-cache-dir .
 
 COPY --from=builder /build/papers.db /app/papers.db

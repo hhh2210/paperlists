@@ -10,18 +10,19 @@ Run via stdio:
     python -m paperlists_mcp.server
 
 Env vars:
-    PAPERLISTS_API_URL   default: https://paperlists.up.railway.app
+    PAPERLISTS_API_URL   default: https://api-production-18d3.up.railway.app
     PAPERLISTS_TIMEOUT   default: 30 (seconds)
 """
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-API_URL = os.environ.get("PAPERLISTS_API_URL", "https://paperlists.up.railway.app").rstrip("/")
+API_URL = os.environ.get("PAPERLISTS_API_URL", "https://api-production-18d3.up.railway.app").rstrip("/")
 TIMEOUT = float(os.environ.get("PAPERLISTS_TIMEOUT", "30"))
 
 mcp = FastMCP("paperlists")
@@ -31,9 +32,17 @@ _client = httpx.Client(base_url=API_URL, timeout=TIMEOUT, headers={"User-Agent":
 def _get(path: str, **params) -> dict:
     # Drop None params so they don't override defaults on the server side.
     clean = {k: v for k, v in params.items() if v is not None}
-    resp = _client.get(path, params=clean)
+    try:
+        resp = _client.get(path, params=clean)
+    except httpx.HTTPError as e:
+        return {"error": "network_error", "detail": str(e)}
     if resp.status_code >= 400:
-        return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:500]}
+        # Surface the API's structured error (e.g. invalid_query) when present.
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"detail": resp.text[:500]}
+        return {"error": body.get("error", f"HTTP {resp.status_code}"), **body}
     return resp.json()
 
 
@@ -56,30 +65,44 @@ def search_papers(
     year_to: Optional[int] = None,
     exclude_rejected: bool = True,
     limit: int = 25,
+    offset: int = 0,
     order_by: str = "relevance",
     include_abstract: bool = False,
+    raw: bool = False,
 ) -> dict:
     """Full-text search over title / abstract / keywords / authors.
 
     Args:
-        query: Free-text query. Multi-word terms are AND'd. FTS5 syntax works
-            ("foo OR bar", "\"exact phrase\"").
+        query: Free-text query. By default, input is split into terms and
+            AND'd together (safe for arbitrary user input). To use FTS5
+            operators (`foo OR bar`, `"exact phrase"`, `title:diffusion`,
+            `reason*`), set `raw=True`.
         conferences: Comma-separated venue list (e.g. "iclr,nips,icml").
             Omit to search all.
         year_from / year_to: Inclusive year filter.
         exclude_rejected: Drop Reject/Withdraw entries (recommended).
         limit: Max results (1-200).
+        offset: Pagination offset. Combine with `has_more` in the response
+            to walk through long result sets — call again with
+            `offset = previous_offset + previous_limit` until `has_more` is
+            false.
         order_by: "relevance" | "year_desc" | "citation_desc" | "rating_desc".
         include_abstract: Set true only if you need full abstracts — they
             cost ~1KB per result.
+        raw: Enable full FTS5 syntax. Malformed expressions return HTTP 400
+            (surfaced as `{error: "invalid_query"}` in the result).
+
+    Returns a dict with `total_matches`, `returned`, `offset`, `limit`,
+    `has_more`, and `results`. Use `has_more` to paginate.
     """
     return _get(
         "/v1/search",
         q=query, conferences=conferences,
         year_from=year_from, year_to=year_to,
         exclude_rejected=exclude_rejected,
-        limit=limit, order_by=order_by,
+        limit=limit, offset=offset, order_by=order_by,
         include_abstract=include_abstract,
+        raw=raw,
     )
 
 
@@ -91,7 +114,7 @@ def get_paper(conf: str, paper_id: str) -> dict:
         conf: Lowercase venue (e.g. "iclr", "nips").
         paper_id: The paper's `id` field from the JSON (OpenReview ID, etc.).
     """
-    return _get(f"/v1/paper/{conf}/{paper_id}")
+    return _get(f"/v1/paper/{quote(conf, safe='')}/{quote(paper_id, safe='')}")
 
 
 @mcp.tool()
@@ -100,6 +123,8 @@ def topic_trend(
     conferences: Optional[str] = None,
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Yearly publication volume + citation-weighted volume for a topic.
 
@@ -107,12 +132,14 @@ def topic_trend(
     Returns a `series` of `{year, papers, citations, by_conf}` records.
 
     Example queries: "diffusion model", "retrieval augmented generation",
-    "mixture of experts", "constitutional AI".
+    "mixture of experts", "constitutional AI". Set `raw=True` for FTS5
+    operator support.
     """
     return _get(
         "/v1/topic_trend",
         q=query, conferences=conferences,
         year_from=year_from, year_to=year_to,
+        exclude_rejected=exclude_rejected, raw=raw,
     )
 
 
@@ -124,9 +151,11 @@ def topic_evolution(
     window: int = 1,
     top_k: int = 15,
     conferences: Optional[str] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Track how a research area evolves: per-window top co-occurring keywords,
-    top venues, and landmark (highest-cited) papers.
+    top venues, and landmark papers.
 
     This is the single best tool for answering "how did <field> change between
     year X and year Y?" It surfaces topic drift inside a query — e.g. asking
@@ -134,14 +163,23 @@ def topic_evolution(
     will show RAG morphing from dense-passage-retrieval era into LLM-coupled
     pipelines.
 
+    Each window includes a `ranking_basis` field — `"gs_citation"` when
+    citations are meaningful, `"rating_avg+status_fallback"` for the current
+    year where citations are near-zero. In the fallback regime, landmarks
+    are sorted by acceptance status (Oral > Spotlight > Poster) and rating,
+    not citations.
+
     Args:
         window: years per bucket (1 = annual, 2 = biennial, ...).
         top_k: keywords/venues per window.
+        exclude_rejected: Drop Reject/Withdraw entries (recommended).
+        raw: Enable full FTS5 syntax in the query.
     """
     return _get(
         "/v1/topic_evolution",
         q=query, year_from=year_from, year_to=year_to,
         window=window, top_k=top_k, conferences=conferences,
+        exclude_rejected=exclude_rejected, raw=raw,
     )
 
 
@@ -153,6 +191,9 @@ def compare_periods(
     period_b_from: int,
     period_b_to: int,
     top_k: int = 15,
+    conferences: Optional[str] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Diff a topic between two year ranges. Returns three buckets per
     dimension (keywords, authors, affiliations):
@@ -163,6 +204,9 @@ def compare_periods(
 
     Use when you have a hypothesis like "RLHF moved from RL conferences to
     NLP conferences between 2022 and 2024" — this tool will confirm or refute.
+
+    Each period in the response exposes both `years: [a, b]` and flat
+    `year_from`/`year_to` fields. Set `raw=True` for FTS5 operator support.
     """
     return _get(
         "/v1/compare_periods",
@@ -170,6 +214,8 @@ def compare_periods(
         period_a_from=period_a_from, period_a_to=period_a_to,
         period_b_from=period_b_from, period_b_to=period_b_to,
         top_k=top_k,
+        conferences=conferences,
+        exclude_rejected=exclude_rejected, raw=raw,
     )
 
 
@@ -190,14 +236,25 @@ def author_trajectory(
 
 
 @mcp.tool()
-def field_landscape(query: str, year: int, top_k: int = 10) -> dict:
+def field_landscape(
+    query: str,
+    year: int,
+    top_k: int = 10,
+    conferences: Optional[str] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
+) -> dict:
     """Snapshot a research field in a specific year: top papers (by citation),
     top authors, top affiliations, top keywords, venue distribution.
 
     Use for "state of <field> in <year>" summaries or to identify the dominant
-    labs in a subfield at a point in time.
+    labs in a subfield at a point in time. `raw=True` enables FTS5 operators.
     """
-    return _get("/v1/field_landscape", q=query, year=year, top_k=top_k)
+    return _get(
+        "/v1/field_landscape",
+        q=query, year=year, top_k=top_k,
+        conferences=conferences, exclude_rejected=exclude_rejected, raw=raw,
+    )
 
 
 @mcp.tool()
@@ -208,10 +265,23 @@ def conference_stats(conf: str, year: int) -> dict:
 
 
 @mcp.tool()
-def top_papers(conf: str, year: int, by: str = "gs_citation", top_k: int = 20) -> dict:
+def top_papers(
+    conf: str, year: int,
+    by: str = "gs_citation",
+    top_k: int = 20,
+    exclude_rejected: bool = True,
+) -> dict:
     """Top-N papers from a single venue-year, ranked by `gs_citation` or
-    `rating`. Returns title, authors, paper_id, URLs."""
-    return _get(f"/v1/top_papers/{conf}/{year}", by=by, top_k=top_k)
+    `rating`. Returns title, authors, paper_id, URLs.
+
+    `exclude_rejected` defaults to True so Reject/Withdraw entries don't
+    pollute the ranking on OpenReview venues (ICLR/ICML/COLM). Set False
+    for raw corpus diagnostics.
+    """
+    return _get(
+        f"/v1/top_papers/{conf}/{year}",
+        by=by, top_k=top_k, exclude_rejected=exclude_rejected,
+    )
 
 
 def main():

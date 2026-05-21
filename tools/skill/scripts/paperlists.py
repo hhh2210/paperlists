@@ -10,16 +10,23 @@ Usage:
 Examples:
     paperlists.py coverage
     paperlists.py search q="diffusion model" year_from=2022 limit=10
+    paperlists.py search q='title:diffusion AND NOT survey' raw=true limit=10
     paperlists.py topic_trend q="rlhf" year_from=2020 year_to=2025
-    paperlists.py topic_evolution q="retrieval augmented" year_from=2020 year_to=2025 window=1
-    paperlists.py compare_periods q="moe" period_a_from=2018 period_a_to=2020 period_b_from=2022 period_b_to=2024
-    paperlists.py field_landscape q="mechanistic interpretability" year=2024
+    paperlists.py topic_evolution q="retrieval augmented" year_from=2020 year_to=2025 window=1 conferences=iclr,nips,icml
+    paperlists.py compare_periods q="moe" period_a_from=2018 period_a_to=2020 period_b_from=2022 period_b_to=2024 exclude_rejected=false
+    paperlists.py field_landscape q="mechanistic interpretability" year=2024 conferences=iclr,nips,icml
     paperlists.py author_trajectory name="Yann LeCun" year_from=2020
     paperlists.py paper conf=iclr paper_id=00SnKBGTsz
     paperlists.py conference_stats conf=iclr year=2024
     paperlists.py top_papers conf=nips year=2023 by=gs_citation top_k=10
 
-Env: PAPERLISTS_API_URL (default https://paperlists.up.railway.app)
+Notes on `q=` queries:
+    By default, input is split into terms and AND'd. To use FTS5 operators
+    (`OR`, `NEAR`, prefix `*`, column filters like `title:foo`, exact
+    phrases), append `raw=true`. Bad raw queries return HTTP 400 with
+    {"error":"invalid_query"}.
+
+Env: PAPERLISTS_API_URL (default https://api-production-18d3.up.railway.app)
 Dependencies: only stdlib (no requests/httpx required).
 """
 from __future__ import annotations
@@ -30,7 +37,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-API_URL = os.environ.get("PAPERLISTS_API_URL", "https://paperlists.up.railway.app").rstrip("/")
+API_URL = os.environ.get("PAPERLISTS_API_URL", "https://api-production-18d3.up.railway.app").rstrip("/")
 
 # Maps the CLI verb to (path_template, list_of_url_args).
 # Path args are pulled out of kwargs; the rest become querystring.
@@ -70,7 +77,7 @@ def main(argv: list[str]) -> int:
     kv = _parse_kv(argv[2:])
 
     try:
-        path = path_tpl.format(**{k: kv.pop(k) for k in path_args})
+        path = path_tpl.format(**{k: urllib.parse.quote(kv.pop(k), safe="") for k in path_args})
     except KeyError as e:
         print(f"missing required path arg: {e.args[0]}", file=sys.stderr)
         return 2

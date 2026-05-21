@@ -1,0 +1,15 @@
+.git
+.github
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/.venv/
+**/*.egg-info/
+.DS_Store
+tools/img/
+tools/mcp-server/.venv/
+tools/query-api/.venv/
+filtered_results-*.json

@@ -2,7 +2,7 @@
 name: paperlists
 description: |
   Search and analyze how AI research has evolved over time, using the
-  papercopilot/paperlists corpus (236k papers across 30 conferences,
+  papercopilot/paperlists corpus (237k+ papers across 30 conferences,
   2010-present). First-class verbs are trend-focused — topic_trend,
   topic_evolution, compare_periods, author_trajectory, field_landscape —
   not just keyword search. Backed by a hosted HTTPS API; no local data
@@ -44,7 +44,7 @@ Weak fit (other tools are better):
 ## How it works
 
 The skill is backed by a hosted HTTPS API at
-**`$PAPERLISTS_API_URL`** (default: `https://paperlists.up.railway.app`).
+**`$PAPERLISTS_API_URL`** (default: `https://api-production-18d3.up.railway.app`).
 You can call it three ways:
 
 1. **MCP** — if `paperlists-mcp` is registered with your host, just use
@@ -52,6 +52,24 @@ You can call it three ways:
 2. **HTTP via the bundled script** — `scripts/paperlists.py <endpoint> [k=v ...]`.
    Use when MCP isn't configured.
 3. **Direct curl** — for one-off ad-hoc queries.
+
+For fully local/offline runs, start the query API against a local sqlite index
+and point this skill at it:
+
+```bash
+cd tools/query-api
+python -m paperlists_api.indexer ../.. ./papers.db
+PAPERLISTS_DB=$PWD/papers.db uvicorn paperlists_api.main:app --port 8000
+```
+
+Then call the same script or MCP server with:
+
+```bash
+cd ../skill
+PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py coverage
+```
+
+The output contract is identical between Railway-hosted and local sqlite modes.
 
 ## Tools / endpoints
 
@@ -69,14 +87,32 @@ You can call it three ways:
 | `top_papers` | `GET /v1/top_papers/{conf}/{year}` | Ranked by citation or rating |
 
 Common params: `q` (query), `conferences` (comma list like `iclr,nips,icml`),
-`year_from`/`year_to`. Abstracts are off by default to control egress —
-pass `include_abstract=true` only if you need the full text.
+`year_from`/`year_to`, and `exclude_rejected` (default `true` for **all** search,
+trend, AND ranking endpoints — including `top_papers`). Pass
+`exclude_rejected=false` only when you explicitly want raw corpus diagnostics
+that include Reject / Withdraw entries. Abstracts are off by default to control
+egress — pass `include_abstract=true` only if you need the full text.
+
+### Response shape notes
+
+- `search_papers` returns `{total_matches, returned, offset, limit, has_more, results, ...}`.
+  Use `has_more` and `offset` to paginate; never assume `results` is exhaustive.
+  (`total` is kept as a back-compat alias for one release; prefer `total_matches`.)
+- `compare_periods` returns each period as `{years: [a, b], year_from, year_to, n_papers}`
+  — both shapes are populated, pick whichever is more ergonomic.
+- `topic_evolution` adds `ranking_basis` to each window: `"gs_citation"` when
+  citations are meaningful, `"rating_avg+status_fallback"` for the current year
+  where citations are near-zero. Treat landmark order as a heuristic in the
+  fallback regime.
+- Bad FTS5 input (unbalanced quotes, raw operators) returns HTTP 400 with
+  `{error: "invalid_query"}`. The MCP/skill wrappers turn this into a normal
+  result object so agents can retry with a cleaner query.
 
 ## Worked patterns
 
 ### Pattern 1 — Research evolution in one shot
 ```bash
-scripts/paperlists.py topic_evolution q="retrieval augmented generation" year_from=2020 year_to=2025 window=1
+scripts/paperlists.py topic_evolution q="retrieval augmented generation" year_from=2020 year_to=2025 window=1 conferences=iclr,nips,icml,acl,emnlp
 ```
 Returns per-year top keywords (e.g. dense passage → llm → multi-hop),
 top venues (emnlp → iclr/nips), and landmark cited papers each year.
@@ -84,7 +120,7 @@ top venues (emnlp → iclr/nips), and landmark cited papers each year.
 
 ### Pattern 2 — Topic drift between two eras
 ```bash
-scripts/paperlists.py compare_periods q="vision transformer" period_a_from=2018 period_a_to=2020 period_b_from=2022 period_b_to=2024
+scripts/paperlists.py compare_periods q="vision transformer" period_a_from=2018 period_a_to=2020 period_b_from=2022 period_b_to=2024 conferences=iclr,nips,icml
 ```
 Returns `emerged` / `faded` / `sustained` for keywords, authors, and
 affiliations. Great for "what's new" or "what's been abandoned" narratives.
@@ -111,8 +147,12 @@ Use the canonical name as it appears on publications.
   wants temporal analysis — one call gives you the structured story.
 - **Set `limit` aggressively low** (5–10) on exploratory `search_papers`
   calls; raise it only after the user confirms direction.
-- **Hyphens and stop-words are handled** server-side ("in-context learning"
-  works; FTS5 syntax like `"exact phrase"` and `term1 OR term2` works too).
+- **Default sanitizer**: hyphens and stop-words are handled server-side
+  ("in-context learning" works). Operators (`OR`, `NOT`, `NEAR`), prefix
+  (`reason*`), column filters (`title:diffusion`), and exact phrases
+  (`"step by step"`) are **NOT** parsed in the default mode — input is
+  split into terms and AND'd. Pass `raw=true` on the endpoint when you
+  need full FTS5 syntax (malformed expressions then return HTTP 400).
 
 ## Bundled script
 

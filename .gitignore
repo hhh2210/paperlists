@@ -46,3 +46,5 @@ papers.db-shm
 tools/query-api/papers.db*
 tools/query-api/.venv/
 tools/mcp-server/.venv/
+tools/query-api/uv.lock
+tools/mcp-server/uv.lock

@@ -1,6 +1,6 @@
 # paperlists-api
 
-A small FastAPI service that exposes the [papercopilot/paperlists](https://github.com/papercopilot/paperlists) corpus over HTTPS, so AI agents (via the companion MCP server, or any HTTP client) can run **trend-focused** queries without downloading the ~830 MB of raw JSON.
+A small FastAPI service that exposes the [papercopilot/paperlists](https://github.com/papercopilot/paperlists) corpus over HTTPS or localhost, so AI agents (via the companion MCP server, the bundled Skill, or any HTTP client) can run **trend-focused** queries without loading hundreds of JSON files on every call.
 
 ## What it does
 
@@ -19,26 +19,44 @@ Built around the observation that flat keyword search is already well served by 
 | `GET /v1/paper/{conf}/{paper_id}` | Single record (full schema, including abstract) |
 | `GET /v1/coverage` | What conferences/years are indexed |
 
+Trend-style endpoints default to `exclude_rejected=true`, matching `/v1/search`
+so survey counts do not mix accepted/poster papers with rejected or withdrawn
+submissions. Set `exclude_rejected=false` for raw corpus diagnostics. Endpoints
+that summarize a field (`topic_trend`, `topic_evolution`, `compare_periods`,
+`field_landscape`, and `search`) also accept `conferences=iclr,nips,icml` style
+comma-separated filters where relevant.
+
 Implementation: sqlite FTS5 over a flattened `papers` table built from the repo's JSON files. Index lives in `papers.db`. Build it locally with:
 
 ```bash
 cd tools/query-api
-pip install -e .
-python -m paperlists_api.indexer ../.. ./papers.db
-PAPERLISTS_DB=$PWD/papers.db uvicorn paperlists_api.main:app --reload
+uv run python -m paperlists_api.indexer ../.. ./papers.db
+PAPERLISTS_DB=$PWD/papers.db uv run uvicorn paperlists_api.main:app --reload
 ```
 
 Then `open http://localhost:8000/docs` for the interactive API browser.
 
+For Skill verification, use the same API through the bundled client:
+
+```bash
+cd ../skill
+PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py coverage
+PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py topic_evolution q="agent" year_from=2020 year_to=2025 window=1
+```
+
 ## Deployment
 
 ### Railway
-- Connect this fork to Railway, set the **build context to the repo root** (so the Dockerfile can `COPY` the conference directories).
-- Railway reads `tools/query-api/railway.json` and uses `tools/query-api/Dockerfile`.
+- Use `tools/query-api` as the Railway upload/build root.
+- The Docker build fetches the paperlists JSON corpus from GitHub inside Railway and builds `papers.db` there. This avoids uploading hundreds of MB of tracked JSON through `railway up`.
+- Railway reads `tools/query-api/railway.json` and uses `Dockerfile` from this directory.
+- Runtime defaults to **4 Uvicorn workers** (`WEB_CONCURRENCY=4`). The rate-limit state is sqlite-backed (`paperlists_api/ratelimit.py`, separate writable file at `/tmp/paperlists-ratelimit.db`) so all workers share one bucket per IP. No risk of `N×limit` bypass from sticky worker routing.
+- `PAPERLISTS_TRUST_PROXY` defaults to `"auto"`, which auto-enables XFF-trust whenever a known platform marker is present in the env (Railway / HF Spaces / Fly / Render / Vercel / Cloud Run / Azure App Service). Set it to `"1"` or `"0"` to override. On any host **not** in that list, set `PAPERLISTS_TRUST_PROXY=1` explicitly or every visitor will share one rate-limit bucket because `req.client.host` resolves to the proxy address. Uvicorn is **not** started with `--forwarded-allow-ips=*` — that flag would let uvicorn itself rewrite `request.client.host` from XFF *before* the middleware runs, defeating the trust gate.
 - Free hobby tier (~$5/mo credit) is sufficient for the demo.
-- Egress is the main cost driver. Two mitigations baked in:
+- Egress is the main cost driver. Three mitigations baked in:
   1. `include_abstract` defaults to `false` on `/v1/search` — abstracts are only sent on `/v1/paper/{conf}/{id}`.
-  2. Token-bucket rate limiter (default 60 req/min/IP, configurable via `PAPERLISTS_RATE_PER_MIN`).
+  2. Token-bucket rate limiter (default 60 req/min/IP, burst 20). Tune via `PAPERLISTS_RATE_PER_MIN`, `PAPERLISTS_RATE_BURST`. Bucket size capped at 10k rows with 30 min stale eviction (`PAPERLISTS_RATE_BUCKET_MAX`, `PAPERLISTS_RATE_STALE_SEC`). GC sweeps run probabilistically (~1% of requests).
+  3. Response field whitelist on cards — large fields like `bibtex`, `reviewers`, `or_profile` are never returned.
 
 ### HF Spaces / Fly.io / self-hosted
 Same Dockerfile, just point at a different host. The index step is the slow part (~1–2 min on cold build).

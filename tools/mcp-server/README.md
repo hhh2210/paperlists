@@ -29,7 +29,7 @@ Add to `~/.config/claude/claude_desktop_config.json` (or use `claude mcp add`):
       "command": "uvx",
       "args": ["paperlists-mcp"],
       "env": {
-        "PAPERLISTS_API_URL": "https://paperlists.up.railway.app"
+        "PAPERLISTS_API_URL": "https://api-production-18d3.up.railway.app"
       }
     }
   }
@@ -54,6 +54,10 @@ Same `command` + `args`. Cursor reads `~/.cursor/mcp.json`; Codex reads `~/.code
 | `conference_stats` | Acceptance + rating/citation distribution |
 | `top_papers` | Ranked by citation or rating |
 
+`search_papers` and the trend-style tools default to `exclude_rejected=true`.
+Use `exclude_rejected=false` only for raw corpus diagnostics. Topic tools also
+accept comma-separated `conferences` filters such as `iclr,nips,icml`.
+
 ## Running against a local index
 
 If you have the paperlists repo cloned and want to avoid the hosted API entirely (offline use, very large queries, custom modifications):
@@ -66,3 +70,9 @@ PAPERLISTS_API_URL=http://localhost:8000 paperlists-mcp
 ```
 
 The MCP server's contract is identical against either backend.
+The same local API override also works for the bundled Skill:
+
+```bash
+cd ../skill
+PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py coverage
+```

@@ -11,19 +11,117 @@ from collections import Counter
 from typing import Iterable, Optional
 
 EXCLUDED_STATUSES_DEFAULT = ("Withdraw", "Reject", "Withdrawn", "Rejected", "Desk Reject")
+_EXCLUDED_STATUSES_LOWER = tuple(s.lower() for s in EXCLUDED_STATUSES_DEFAULT)
 
-# FTS5 sanitizer.
-# - Strip characters that aren't word/space/quote.
-# - Treat hyphens as spaces (FTS5 reads `-token` as "NOT token", which breaks
-#   queries like "in-context learning"). Quoted hyphens are also fragile, so
-#   the safest behavior is plain whitespace AND.
-_FTS_BAD = re.compile(r"[^\w\s\"]+", flags=re.UNICODE)
+
+class FTSQueryError(ValueError):
+    """User query couldn't be parsed by FTS5. API layer maps this to HTTP 400."""
+
+
+# FTS5 input is treated as a *quoted phrase per token*, then AND-joined.
+# This neutralizes the FTS5 query language entirely: operators like AND/OR/NOT/
+# NEAR, prefix-NOT (`-foo`), column filters (`title:`), and unbalanced quotes
+# can no longer fall through and either change semantics or raise
+# sqlite3.OperationalError. The trade-off is that users lose FTS5 syntax —
+# acceptable for an agent-facing API where "search for these terms" is the
+# overwhelming dominant case.
+_FTS_KEEP = re.compile(r"[^\w\s]+", flags=re.UNICODE)
+
+
+def _fts_tokens(q: str) -> list[str]:
+    """Split user text into FTS5-safe tokens. Drops punctuation; hyphens
+    become whitespace so `in-context` doesn't read as the NOT-operator."""
+    if not q:
+        return []
+    cleaned = _FTS_KEEP.sub(" ", q.replace("-", " "))
+    return [t for t in cleaned.split() if t]
 
 
 def sanitize_fts(q: str) -> str:
-    q = (q or "").replace("-", " ")
-    q = _FTS_BAD.sub(" ", q)
-    return " ".join(q.split())
+    """Turn user text into a safe FTS5 expression.
+
+    Each token is wrapped in double quotes so FTS5 operators (AND/OR/NOT/NEAR,
+    column filters, `-`-prefix-NOT, prefix `*`) and unbalanced quotes can
+    never fall through. Tokens are joined by whitespace (FTS5 implicit AND).
+
+    **Trade-off:** documented FTS5 power features (`foo OR bar`,
+    `"exact phrase"`, `title:diffusion`, `reason*`) are NOT honored under
+    this default. Use `raw=True` on the endpoint to opt back in to full
+    FTS5 syntax (syntax errors then return HTTP 400).
+    """
+    return " ".join(f'"{t}"' for t in _fts_tokens(q))
+
+
+def sanitize_fts_phrase_in(column: str, q: str) -> str:
+    """Build an FTS5 column-scoped phrase: `column:"tok1 tok2"`. Used for
+    authors lookup where we want a single ordered phrase, not term-AND."""
+    tokens = _fts_tokens(q)
+    if not tokens:
+        return ""
+    return f'{column}:"{" ".join(tokens)}"'
+
+
+def _prepare_query(q: str, raw: bool) -> str:
+    """Map user input to an FTS5 expression. With `raw=True` we trust the
+    caller and let FTS5 parse the input as-is; the syntax-error → 400
+    mapping in `_run_fts` still keeps malformed input from 500'ing."""
+    if raw:
+        return (q or "").strip()
+    return sanitize_fts(q)
+
+
+# Known FTS5 parse-error fingerprints. Anything *not* in this set is a
+# server-side problem (missing table, locked db, schema drift, ...) and
+# should bubble up as 5xx rather than be mislabelled `invalid_query`.
+#
+# "no such column" looks server-side at first glance, but FTS5 emits it
+# when the user types a `bad_col:value` filter inside a raw MATCH — that's
+# a user parse error. We only honor this marker in raw mode (where users
+# can write column filters at all); in sanitized mode the sanitizer can
+# never produce a column-filter token, so a "no such column" there really
+# does indicate schema drift and should propagate.
+# Empirically derived by feeding bad input to FTS5; tests below pin the set.
+_FTS_PARSE_ERROR_MARKERS = (
+    "fts5: syntax error",          # AND/OR/NEAR misuse, unbalanced parens
+    "fts5: parse error",
+    "malformed match",
+    "unterminated string",         # unbalanced double-quote
+    "parse error",
+    "no such column",              # raw-mode `badcol:value` filter typo
+    "unknown special query",       # `*foo` and other special-query syntax errors
+    "fts5: unknown",               # variants of the above
+)
+
+
+def _run_fts(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: list,
+    *,
+    raw: bool = False,
+) -> list:
+    """Execute an FTS5-backed query.
+
+    When `raw=True` the caller passed user input verbatim into the MATCH
+    expression, so FTS5 parse errors are user-facing and we translate them
+    to FTSQueryError (HTTP 400 at the API layer). Any other sqlite error
+    (missing table, schema drift, db locked) propagates as-is so it
+    surfaces as a 5xx, not a misleading `invalid_query`.
+
+    When `raw=False` (default), the input was produced by `sanitize_fts`
+    which only emits quoted phrase tokens — that grammar is closed and
+    cannot fail. So we don't catch anything: if it fails, it's a server
+    bug and should be loud."""
+    try:
+        return conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as e:
+        if not raw:
+            raise
+        msg = str(e).lower()
+        if any(marker in msg for marker in _FTS_PARSE_ERROR_MARKERS):
+            raise FTSQueryError(str(e)) from e
+        # Looked like an operational/server error even in raw mode — leak it.
+        raise
 
 
 def _conf_filter(confs: Optional[list[str]]) -> tuple[str, list]:
@@ -46,11 +144,12 @@ def _year_filter(year_from: Optional[int], year_to: Optional[int]) -> tuple[str,
     return " AND " + " AND ".join(parts), params
 
 
-def _exclude_rejected_filter(exclude: bool) -> tuple[str, list]:
+def _exclude_rejected_filter(exclude: bool, *, alias: str = "p") -> tuple[str, list]:
     if not exclude:
         return "", []
-    placeholders = ",".join("?" * len(EXCLUDED_STATUSES_DEFAULT))
-    return f" AND (p.status IS NULL OR p.status NOT IN ({placeholders}))", list(EXCLUDED_STATUSES_DEFAULT)
+    placeholders = ",".join("?" * len(_EXCLUDED_STATUSES_LOWER))
+    col = f"{alias}.status" if alias else "status"
+    return f" AND ({col} IS NULL OR LOWER({col}) NOT IN ({placeholders}))", list(_EXCLUDED_STATUSES_LOWER)
 
 
 def _row_to_card(row: dict, *, include_abstract: bool) -> dict:
@@ -87,11 +186,23 @@ def search_papers(
     offset: int = 0,
     order_by: str = "relevance",
     include_abstract: bool = False,
+    raw: bool = False,
 ) -> dict:
-    """Full-text search across title/abstract/keywords/authors."""
-    q_clean = sanitize_fts(q)
+    """Full-text search across title/abstract/keywords/authors.
+
+    Default (`raw=False`): input is split into terms, each wrapped in
+    double quotes, AND'd together. Safe for arbitrary user input.
+
+    With `raw=True`: input is passed to FTS5 as-is, so callers can use
+    `foo OR bar`, `"exact phrase"`, `title:diffusion`, `reason*`. Malformed
+    expressions raise FTSQueryError (HTTP 400 at the API layer).
+    """
+    q_clean = _prepare_query(q, raw)
     if not q_clean:
-        return {"total": 0, "results": []}
+        return {
+            "total_matches": 0, "returned": 0, "offset": offset,
+            "limit": limit, "has_more": False, "total": 0, "results": [],
+        }
 
     conf_sql, conf_params = _conf_filter(conferences)
     year_sql, year_params = _year_filter(year_from, year_to)
@@ -114,7 +225,7 @@ def search_papers(
         LIMIT ? OFFSET ?
     """
     params = [q_clean, *conf_params, *year_params, *excl_params, limit, offset]
-    rows = conn.execute(sql, params).fetchall()
+    rows = _run_fts(conn, sql, params, raw=raw)
 
     count_sql = f"""
         SELECT COUNT(*) AS n
@@ -123,11 +234,19 @@ def search_papers(
         WHERE papers_fts MATCH ?
           {conf_sql}{year_sql}{excl_sql}
     """
-    total = conn.execute(count_sql, [q_clean, *conf_params, *year_params, *excl_params]).fetchone()["n"]
+    total = _run_fts(conn, count_sql, [q_clean, *conf_params, *year_params, *excl_params], raw=raw)[0]["n"]
 
+    cards = [_row_to_card(r, include_abstract=include_abstract) for r in rows]
     return {
+        # Primary, agent-friendly field name (matches the rest of the API).
+        "total_matches": total,
+        "returned": len(cards),
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + len(cards)) < total,
+        # Back-compat alias — keep one release, then remove.
         "total": total,
-        "results": [_row_to_card(r, include_abstract=include_abstract) for r in rows],
+        "results": cards,
     }
 
 
@@ -173,9 +292,14 @@ def topic_trend(
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
     exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
-    """Yearly paper count + citation-weighted volume for a topic query."""
-    q_clean = sanitize_fts(q)
+    """Yearly paper count + citation-weighted volume for a topic query.
+
+    `raw=True` passes the query to FTS5 verbatim (full operator support);
+    default sanitizes input into AND'd quoted terms.
+    """
+    q_clean = _prepare_query(q, raw)
     if not q_clean:
         return {"query": q, "series": []}
 
@@ -197,7 +321,7 @@ def topic_trend(
         ORDER BY p.year, p.conf
     """
     params = [q_clean, *conf_params, *year_params, *excl_params]
-    rows = conn.execute(sql, params).fetchall()
+    rows = _run_fts(conn, sql, params, raw=raw)
 
     # Also yearly totals (any conference matching) for denominator/visualization.
     yearly: dict[int, dict] = {}
@@ -240,61 +364,120 @@ def topic_evolution(
     window: int = 1,
     top_k: int = 15,
     conferences: Optional[list[str]] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Per-year (or per-window) top co-occurring keywords and top venues.
 
     For each year window, fetch papers matching `q` and aggregate keyword
     frequencies. Surfaces topic drift inside a research area.
+
+    `raw=True` enables full FTS5 syntax in the query (operators, prefix,
+    column filters); default sanitizes input.
     """
-    q_clean = sanitize_fts(q)
+    q_clean = _prepare_query(q, raw)
     if not q_clean or year_from > year_to:
         return {"query": q, "windows": []}
 
     conf_sql, conf_params = _conf_filter(conferences)
+    excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
+    sql = f"""
+        SELECT p.keywords AS keywords, p.conf AS conf, p.title AS title,
+               p.gs_citation AS cites, p.rating_avg AS rating, p.status AS status,
+               p.year AS year, p.paper_id AS paper_id
+        FROM papers_fts
+        JOIN papers p ON p.id = papers_fts.rowid
+        WHERE papers_fts MATCH ?
+          AND p.year BETWEEN ? AND ?
+          {conf_sql}{excl_sql}
+    """
+    rows = _run_fts(conn, sql, [q_clean, year_from, year_to, *conf_params, *excl_params], raw=raw)
 
-    windows = []
+    buckets: dict[int, dict] = {}
     y = year_from
     while y <= year_to:
         w_end = min(y + window - 1, year_to)
-        sql = f"""
-            SELECT p.keywords AS keywords, p.conf AS conf, p.title AS title,
-                   p.gs_citation AS cites, p.year AS year, p.paper_id AS paper_id
-            FROM papers_fts
-            JOIN papers p ON p.id = papers_fts.rowid
-            WHERE papers_fts MATCH ?
-              AND p.year BETWEEN ? AND ?
-              {conf_sql}
-        """
-        rows = conn.execute(sql, [q_clean, y, w_end, *conf_params]).fetchall()
-
-        kw_counter: Counter[str] = Counter()
-        conf_counter: Counter[str] = Counter()
-        for r in rows:
-            for kw in _tokenize_keywords(r["keywords"]):
-                kw_counter[kw] += 1
-            if r["conf"]:
-                conf_counter[r["conf"]] += 1
-
-        # Surface top-cited paper of the window as a "landmark".
-        landmarks = sorted(
-            [r for r in rows if r["cites"]],
-            key=lambda r: r["cites"] or 0,
-            reverse=True,
-        )[:5]
-
-        windows.append({
+        buckets[y] = {
             "year_from": y,
             "year_to": w_end,
-            "n_papers": len(rows),
-            "top_keywords": kw_counter.most_common(top_k),
-            "top_venues": conf_counter.most_common(10),
+            "n_papers": 0,
+            "keywords": Counter(),
+            "venues": Counter(),
+            "candidates": [],
+            "max_cite": 0,
+        }
+        y = w_end + 1
+
+    # Status weight: prefer accepted-with-distinction → poster → unknown.
+    _STATUS_BONUS = {
+        "oral": 3.0, "spotlight": 2.0, "poster": 1.0,
+        "accept": 1.0, "accepted": 1.0,
+    }
+
+    for r in rows:
+        start = year_from + ((r["year"] - year_from) // window) * window
+        bucket = buckets[start]
+        bucket["n_papers"] += 1
+        for kw in _tokenize_keywords(r["keywords"]):
+            bucket["keywords"][kw] += 1
+        if r["conf"]:
+            bucket["venues"][r["conf"]] += 1
+        # Track every candidate; rank later with a citation-or-rating blend.
+        bucket["candidates"].append(r)
+        if (r["cites"] or 0) > bucket["max_cite"]:
+            bucket["max_cite"] = r["cites"] or 0
+
+    def _row_features(row: dict) -> tuple:
+        cite = row["cites"] or 0
+        rating = row["rating"] or 0.0
+        status = (row["status"] or "").lower()
+        bonus = _STATUS_BONUS.get(status, 0.0)
+        return cite, rating, bonus
+
+    def _key_by_citation(row: dict) -> tuple:
+        cite, rating, bonus = _row_features(row)
+        return (cite, rating, bonus)
+
+    def _key_by_rating(row: dict) -> tuple:
+        # In the fallback regime ratings + acceptance bonus dominate. We
+        # still include citation as the deepest tiebreaker so 1-cite vs
+        # 0-cite among otherwise-identical papers stays deterministic.
+        cite, rating, bonus = _row_features(row)
+        return (bonus, rating, cite)
+
+    windows = []
+    for y in sorted(buckets):
+        bucket = buckets[y]
+        # Citation-only is unfair for the current year (papers <1 year old have
+        # near-zero gs_citation). When the window's max citation is low, the
+        # landmark ranking degenerates to "earliest-published venue wins" —
+        # one weak paper with a single cite would beat a strong Spotlight
+        # with 0 cites. Switch to a rating-and-status sort in that regime.
+        if bucket["max_cite"] >= 20:
+            ranking_basis = "gs_citation"
+            key_fn = _key_by_citation
+        else:
+            ranking_basis = "rating_avg+status_fallback"
+            key_fn = _key_by_rating
+        landmarks = sorted(bucket["candidates"], key=key_fn, reverse=True)[:5]
+        windows.append({
+            "year_from": bucket["year_from"],
+            "year_to": bucket["year_to"],
+            "n_papers": bucket["n_papers"],
+            "ranking_basis": ranking_basis,
+            "top_keywords": bucket["keywords"].most_common(top_k),
+            "top_venues": bucket["venues"].most_common(10),
             "landmark_papers": [
-                {"conf": r["conf"], "year": r["year"], "paper_id": r["paper_id"],
-                 "title": r["title"], "gs_citation": r["cites"]}
+                {
+                    "conf": r["conf"], "year": r["year"], "paper_id": r["paper_id"],
+                    "title": r["title"],
+                    "gs_citation": r["cites"],
+                    "rating_avg": r["rating"],
+                    "status": r["status"],
+                }
                 for r in landmarks
             ],
         })
-        y = w_end + 1
 
     return {"query": q, "window": window, "windows": windows}
 
@@ -311,7 +494,9 @@ def author_trajectory(
         return {"name": name, "by_year": []}
 
     # We match against the `authors` FTS column as an exact-phrase token.
-    q_phrase = f'authors:"{sanitize_fts(name)}"'
+    q_phrase = sanitize_fts_phrase_in("authors", name)
+    if not q_phrase:
+        return {"name": name, "total_papers": 0, "by_year": []}
     year_sql, year_params = _year_filter(year_from, year_to)
     sql = f"""
         SELECT p.year, p.conf, p.paper_id, p.title, p.authors, p.gs_citation, p.status
@@ -321,7 +506,7 @@ def author_trajectory(
           {year_sql}
         ORDER BY p.year DESC, p.gs_citation DESC NULLS LAST
     """
-    rows = conn.execute(sql, [q_phrase, *year_params]).fetchall()
+    rows = _run_fts(conn, sql, [q_phrase, *year_params])
 
     by_year: dict[int, list] = {}
     for r in rows:
@@ -348,23 +533,33 @@ def field_landscape(
     q: str,
     year: int,
     top_k: int = 10,
+    conferences: Optional[list[str]] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Single-year snapshot for a field: top papers, top authors, top affiliations,
-    top keywords. Useful for 'state of <field> in <year>' summaries."""
-    q_clean = sanitize_fts(q)
+    top keywords. Useful for 'state of <field> in <year>' summaries.
+
+    `raw=True` enables full FTS5 syntax."""
+    q_clean = _prepare_query(q, raw)
     if not q_clean:
         return {"query": q, "year": year}
 
-    rows = conn.execute(
-        """
+    conf_sql, conf_params = _conf_filter(conferences)
+    excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
+    rows = _run_fts(
+        conn,
+        f"""
         SELECT p.conf, p.year, p.paper_id, p.title, p.authors, p.affiliations,
                p.keywords, p.gs_citation, p.rating_avg, p.status, p.openreview, p.site
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
         WHERE papers_fts MATCH ? AND p.year = ?
+          {conf_sql}{excl_sql}
         """,
-        [q_clean, year],
-    ).fetchall()
+        [q_clean, year, *conf_params, *excl_params],
+        raw=raw,
+    )
 
     author_counter: Counter[str] = Counter()
     aff_counter: Counter[str] = Counter()
@@ -412,38 +607,77 @@ def compare_periods(
     period_a: tuple[int, int],
     period_b: tuple[int, int],
     top_k: int = 15,
+    conferences: Optional[list[str]] = None,
+    exclude_rejected: bool = True,
+    raw: bool = False,
 ) -> dict:
     """Diff a topic between two year ranges. Returns keywords/authors/affiliations
-    that emerged, disappeared, or stayed across the two periods."""
-    def _bucket(years: tuple[int, int]) -> dict:
-        q_clean = sanitize_fts(q)
-        rows = conn.execute(
-            """
-            SELECT p.authors, p.affiliations, p.keywords, p.title, p.paper_id, p.conf, p.year, p.gs_citation
-            FROM papers_fts
-            JOIN papers p ON p.id = papers_fts.rowid
-            WHERE papers_fts MATCH ? AND p.year BETWEEN ? AND ?
-            """,
-            [q_clean, years[0], years[1]],
-        ).fetchall()
-        authors: Counter[str] = Counter()
-        affs: Counter[str] = Counter()
-        kws: Counter[str] = Counter()
-        for r in rows:
-            for a in (r["authors"] or "").split(";"):
-                a = a.strip()
-                if a:
-                    authors[a] += 1
-            for af in (r["affiliations"] or "").split(";"):
-                af = af.strip()
-                if af:
-                    affs[af] += 1
-            for kw in _tokenize_keywords(r["keywords"]):
-                kws[kw] += 1
-        return {"n_papers": len(rows), "authors": authors, "affiliations": affs, "keywords": kws}
+    that emerged, disappeared, or stayed across the two periods.
 
-    a = _bucket(period_a)
-    b = _bucket(period_b)
+    `raw=True` enables full FTS5 syntax."""
+    def _period_meta(p: tuple[int, int], n: int) -> dict:
+        # Expose both shapes so clients can use either `years[0]/[1]` or
+        # the flat `year_from`/`year_to` form.
+        return {
+            "years": list(p),
+            "year_from": p[0],
+            "year_to": p[1],
+            "n_papers": n,
+        }
+
+    q_clean = _prepare_query(q, raw)
+    if not q_clean:
+        empty = {"emerged": [], "faded": [], "sustained": []}
+        return {
+            "query": q,
+            "period_a": _period_meta(period_a, 0),
+            "period_b": _period_meta(period_b, 0),
+            "keyword_diff": empty,
+            "author_diff": empty,
+            "affiliation_diff": empty,
+        }
+
+    lo = min(period_a[0], period_b[0])
+    hi = max(period_a[1], period_b[1])
+    conf_sql, conf_params = _conf_filter(conferences)
+    excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
+    rows = _run_fts(
+        conn,
+        f"""
+        SELECT p.authors, p.affiliations, p.keywords, p.year
+        FROM papers_fts
+        JOIN papers p ON p.id = papers_fts.rowid
+        WHERE papers_fts MATCH ? AND p.year BETWEEN ? AND ?
+          {conf_sql}{excl_sql}
+        """,
+        [q_clean, lo, hi, *conf_params, *excl_params],
+        raw=raw,
+    )
+
+    def _empty_bucket() -> dict:
+        return {"n_papers": 0, "authors": Counter(), "affiliations": Counter(), "keywords": Counter()}
+
+    a = _empty_bucket()
+    b = _empty_bucket()
+
+    def _add(bucket: dict, r: dict) -> None:
+        bucket["n_papers"] += 1
+        for author in (r["authors"] or "").split(";"):
+            author = author.strip()
+            if author:
+                bucket["authors"][author] += 1
+        for aff in (r["affiliations"] or "").split(";"):
+            aff = aff.strip()
+            if aff:
+                bucket["affiliations"][aff] += 1
+        for kw in _tokenize_keywords(r["keywords"]):
+            bucket["keywords"][kw] += 1
+
+    for r in rows:
+        if period_a[0] <= r["year"] <= period_a[1]:
+            _add(a, r)
+        if period_b[0] <= r["year"] <= period_b[1]:
+            _add(b, r)
 
     def _diff(ca: Counter, cb: Counter, k: int):
         emerged = [(x, cb[x]) for x in cb if x not in ca]
@@ -460,8 +694,8 @@ def compare_periods(
 
     return {
         "query": q,
-        "period_a": {"years": period_a, "n_papers": a["n_papers"]},
-        "period_b": {"years": period_b, "n_papers": b["n_papers"]},
+        "period_a": _period_meta(period_a, a["n_papers"]),
+        "period_b": _period_meta(period_b, b["n_papers"]),
         "keyword_diff": _diff(a["keywords"], b["keywords"], top_k),
         "author_diff": _diff(a["authors"], b["authors"], top_k),
         "affiliation_diff": _diff(a["affiliations"], b["affiliations"], top_k),
@@ -518,21 +752,30 @@ def top_papers(
     year: int,
     by: str = "gs_citation",
     top_k: int = 20,
+    exclude_rejected: bool = True,
 ) -> dict:
     by_col = {
         "gs_citation": "gs_citation",
         "rating": "rating_avg",
         "rating_avg": "rating_avg",
     }.get(by, "gs_citation")
+    excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected, alias="")
     rows = conn.execute(
         f"""
         SELECT conf, year, paper_id, title, authors, status, track, site,
                openreview, rating_avg, gs_citation
         FROM papers
         WHERE conf=? AND year=? AND {by_col} IS NOT NULL
+          {excl_sql}
         ORDER BY {by_col} DESC
         LIMIT ?
         """,
-        (conf.lower(), year, top_k),
+        (conf.lower(), year, *excl_params, top_k),
     ).fetchall()
-    return {"conf": conf, "year": year, "ranked_by": by_col, "results": rows}
+    return {
+        "conf": conf,
+        "year": year,
+        "ranked_by": by_col,
+        "exclude_rejected": exclude_rejected,
+        "results": [dict(r) for r in rows],
+    }
