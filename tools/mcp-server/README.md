@@ -2,7 +2,9 @@
 
 An MCP (Model Context Protocol) server that exposes the [papercopilot/paperlists](https://github.com/papercopilot/paperlists) corpus to AI agents — Claude Code, Claude Desktop, Cursor, Codex, OpenAI ChatGPT (via MCP), Hermes, anything that speaks MCP.
 
-A thin wrapper around the hosted [`paperlists-api`](../query-api/) service: zero data download, zero local index. ~5 MB install footprint.
+A thin wrapper around any hosted [`paperlists-api`](../query-api/) service:
+zero data download, zero local index. ~5 MB install footprint. Set
+`PAPERLISTS_API_URL` to a papercopilot-owned, self-hosted, or demo API endpoint.
 
 ## Why MCP?
 
@@ -16,6 +18,9 @@ pip install -e .
 # or:
 uvx --from . paperlists-mcp
 ```
+
+`PAPERLISTS_API_URL` is required at runtime. For demo testing only, use
+`https://api-production-18d3.up.railway.app`.
 
 ## Register with your MCP client
 

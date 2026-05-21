@@ -12,10 +12,24 @@ from typing import Iterable, Optional
 
 EXCLUDED_STATUSES_DEFAULT = ("Withdraw", "Reject", "Withdrawn", "Rejected", "Desk Reject")
 _EXCLUDED_STATUSES_LOWER = tuple(s.lower() for s in EXCLUDED_STATUSES_DEFAULT)
+MAX_ANALYSIS_MATCHES = 50_000
 
 
 class FTSQueryError(ValueError):
     """User query couldn't be parsed by FTS5. API layer maps this to HTTP 400."""
+
+
+class TooManyMatchesError(ValueError):
+    """Analysis query matched too many rows to aggregate safely in one worker."""
+
+    def __init__(self, *, endpoint: str, matches: int, max_matches: int):
+        self.endpoint = endpoint
+        self.matches = matches
+        self.max_matches = max_matches
+        super().__init__(
+            f"{endpoint} matched {matches} papers; narrow the years, venues, "
+            f"or query terms below {max_matches}"
+        )
 
 
 # FTS5 input is treated as a *quoted phrase per token*, then AND-joined.
@@ -66,7 +80,9 @@ def _prepare_query(q: str, raw: bool) -> str:
     caller and let FTS5 parse the input as-is; the syntax-error → 400
     mapping in `_run_fts` still keeps malformed input from 500'ing."""
     if raw:
-        return (q or "").strip()
+        raw_query = (q or "").strip()
+        _validate_raw_fts_columns(raw_query)
+        return raw_query
     return sanitize_fts(q)
 
 
@@ -74,12 +90,6 @@ def _prepare_query(q: str, raw: bool) -> str:
 # server-side problem (missing table, locked db, schema drift, ...) and
 # should bubble up as 5xx rather than be mislabelled `invalid_query`.
 #
-# "no such column" looks server-side at first glance, but FTS5 emits it
-# when the user types a `bad_col:value` filter inside a raw MATCH — that's
-# a user parse error. We only honor this marker in raw mode (where users
-# can write column filters at all); in sanitized mode the sanitizer can
-# never produce a column-filter token, so a "no such column" there really
-# does indicate schema drift and should propagate.
 # Empirically derived by feeding bad input to FTS5; tests below pin the set.
 _FTS_PARSE_ERROR_MARKERS = (
     "fts5: syntax error",          # AND/OR/NEAR misuse, unbalanced parens
@@ -87,10 +97,44 @@ _FTS_PARSE_ERROR_MARKERS = (
     "malformed match",
     "unterminated string",         # unbalanced double-quote
     "parse error",
-    "no such column",              # raw-mode `badcol:value` filter typo
     "unknown special query",       # `*foo` and other special-query syntax errors
     "fts5: unknown",               # variants of the above
 )
+_ALLOWED_RAW_FTS_COLUMNS = {"title", "abstract", "keywords", "authors"}
+_RAW_COLUMN_FILTER_RE = re.compile(r"(?:^|[\s(])([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_SQLITE_NO_SUCH_COLUMN_RE = re.compile(r"no such column:\s*([A-Za-z_][\w.]*)")
+
+
+def _raw_fts_user_column_error(msg: str, raw_query: str) -> bool:
+    """Return true when sqlite's `no such column` came from FTS5 syntax.
+
+    FTS5 reports both `badcol:value` and `foo -bar` as `no such column`,
+    which looks identical to a real SQL/schema bug. Treat it as user input
+    only when the identifier appears in the raw MATCH expression in one of
+    those FTS-specific forms. Dotted names (`p.status`) are SQL columns and
+    should propagate as server errors.
+    """
+    m = _SQLITE_NO_SUCH_COLUMN_RE.search(msg)
+    if not m:
+        return False
+    col = m.group(1).lower()
+    if "." in col:
+        return False
+    q = raw_query.lower()
+    return bool(
+        re.search(rf"(?:^|[\s(]){re.escape(col)}\s*:", q)
+        or re.search(rf"(?:^|[\s(])-{re.escape(col)}\b", q)
+    )
+
+
+def _validate_raw_fts_columns(q: str) -> None:
+    for m in _RAW_COLUMN_FILTER_RE.finditer(q or ""):
+        col = m.group(1).lower()
+        if col not in _ALLOWED_RAW_FTS_COLUMNS:
+            raise FTSQueryError(
+                f"unknown FTS5 column {col!r}; allowed columns are "
+                f"{', '.join(sorted(_ALLOWED_RAW_FTS_COLUMNS))}"
+            )
 
 
 def _run_fts(
@@ -118,10 +162,43 @@ def _run_fts(
         if not raw:
             raise
         msg = str(e).lower()
+        raw_query = str(params[0] if params else "")
+        if _raw_fts_user_column_error(msg, raw_query):
+            raise FTSQueryError(str(e)) from e
         if any(marker in msg for marker in _FTS_PARSE_ERROR_MARKERS):
             raise FTSQueryError(str(e)) from e
         # Looked like an operational/server error even in raw mode — leak it.
         raise
+
+
+def _enforce_analysis_match_cap(
+    conn: sqlite3.Connection,
+    count_sql: str,
+    params: list,
+    *,
+    raw: bool,
+    endpoint: str,
+    max_matches: Optional[int] = None,
+) -> int:
+    """Count FTS matches before broad in-memory aggregations.
+
+    Trend endpoints intentionally compute keyword / author / affiliation
+    counters in Python because their output shape is nested and agent-facing.
+    A broad query like "learning" over 15+ years can match a large fraction of
+    the corpus, so count first and fail closed instead of materializing every
+    row in a Railway worker.
+    """
+    if max_matches is None:
+        max_matches = MAX_ANALYSIS_MATCHES
+    rows = _run_fts(conn, count_sql, params, raw=raw)
+    matches = int(rows[0]["n"]) if rows else 0
+    if matches > max_matches:
+        raise TooManyMatchesError(
+            endpoint=endpoint,
+            matches=matches,
+            max_matches=max_matches,
+        )
+    return matches
 
 
 def _conf_filter(confs: Optional[list[str]]) -> tuple[str, list]:
@@ -311,8 +388,7 @@ def topic_trend(
         SELECT p.year AS year,
                p.conf AS conf,
                COUNT(*) AS papers,
-               COALESCE(SUM(p.gs_citation), 0) AS citations,
-               AVG(p.rating_avg) AS avg_rating
+               COALESCE(SUM(p.gs_citation), 0) AS citations
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
         WHERE papers_fts MATCH ?
@@ -381,17 +457,32 @@ def topic_evolution(
 
     conf_sql, conf_params = _conf_filter(conferences)
     excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
-    sql = f"""
-        SELECT p.keywords AS keywords, p.conf AS conf, p.title AS title,
-               p.gs_citation AS cites, p.rating_avg AS rating, p.status AS status,
-               p.year AS year, p.paper_id AS paper_id
+    from_where_sql = f"""
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
         WHERE papers_fts MATCH ?
           AND p.year BETWEEN ? AND ?
           {conf_sql}{excl_sql}
     """
-    rows = _run_fts(conn, sql, [q_clean, year_from, year_to, *conf_params, *excl_params], raw=raw)
+    params = [q_clean, year_from, year_to, *conf_params, *excl_params]
+    total_matches = _enforce_analysis_match_cap(
+        conn,
+        f"SELECT COUNT(*) AS n {from_where_sql}",
+        params,
+        raw=raw,
+        endpoint="topic_evolution",
+    )
+    rows = _run_fts(
+        conn,
+        f"""
+        SELECT p.keywords AS keywords, p.conf AS conf, p.title AS title,
+               p.gs_citation AS cites, p.rating_avg AS rating, p.status AS status,
+               p.year AS year, p.paper_id AS paper_id
+        {from_where_sql}
+        """,
+        params,
+        raw=raw,
+    )
 
     buckets: dict[int, dict] = {}
     y = year_from
@@ -479,7 +570,7 @@ def topic_evolution(
             ],
         })
 
-    return {"query": q, "window": window, "windows": windows}
+    return {"query": q, "window": window, "total_matches": total_matches, "windows": windows}
 
 
 def author_trajectory(
@@ -547,17 +638,28 @@ def field_landscape(
 
     conf_sql, conf_params = _conf_filter(conferences)
     excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
+    from_where_sql = f"""
+        FROM papers_fts
+        JOIN papers p ON p.id = papers_fts.rowid
+        WHERE papers_fts MATCH ? AND p.year = ?
+          {conf_sql}{excl_sql}
+    """
+    params = [q_clean, year, *conf_params, *excl_params]
+    _enforce_analysis_match_cap(
+        conn,
+        f"SELECT COUNT(*) AS n {from_where_sql}",
+        params,
+        raw=raw,
+        endpoint="field_landscape",
+    )
     rows = _run_fts(
         conn,
         f"""
         SELECT p.conf, p.year, p.paper_id, p.title, p.authors, p.affiliations,
                p.keywords, p.gs_citation, p.rating_avg, p.status, p.openreview, p.site
-        FROM papers_fts
-        JOIN papers p ON p.id = papers_fts.rowid
-        WHERE papers_fts MATCH ? AND p.year = ?
-          {conf_sql}{excl_sql}
+        {from_where_sql}
         """,
-        [q_clean, year, *conf_params, *excl_params],
+        params,
         raw=raw,
     )
 
@@ -641,16 +743,27 @@ def compare_periods(
     hi = max(period_a[1], period_b[1])
     conf_sql, conf_params = _conf_filter(conferences)
     excl_sql, excl_params = _exclude_rejected_filter(exclude_rejected)
-    rows = _run_fts(
-        conn,
-        f"""
-        SELECT p.authors, p.affiliations, p.keywords, p.year
+    from_where_sql = f"""
         FROM papers_fts
         JOIN papers p ON p.id = papers_fts.rowid
         WHERE papers_fts MATCH ? AND p.year BETWEEN ? AND ?
           {conf_sql}{excl_sql}
+    """
+    params = [q_clean, lo, hi, *conf_params, *excl_params]
+    total_matches = _enforce_analysis_match_cap(
+        conn,
+        f"SELECT COUNT(*) AS n {from_where_sql}",
+        params,
+        raw=raw,
+        endpoint="compare_periods",
+    )
+    rows = _run_fts(
+        conn,
+        f"""
+        SELECT p.authors, p.affiliations, p.keywords, p.year
+        {from_where_sql}
         """,
-        [q_clean, lo, hi, *conf_params, *excl_params],
+        params,
         raw=raw,
     )
 
@@ -694,6 +807,7 @@ def compare_periods(
 
     return {
         "query": q,
+        "total_matches": total_matches,
         "period_a": _period_meta(period_a, a["n_papers"]),
         "period_b": _period_meta(period_b, b["n_papers"]),
         "keyword_diff": _diff(a["keywords"], b["keywords"], top_k),

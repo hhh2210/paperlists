@@ -88,7 +88,7 @@ the user asks evolution-shaped questions.
   malformed expressions.
 - Production keeps **4 Uvicorn workers**. Rate-limit state is sqlite-backed in
   a separate writable DB, so all workers share one bucket per IP.
-- Regression suite: **32 tests passing**, plus live smoke tests against the
+- Regression suite: **37 tests passing**, plus live smoke tests against the
   Railway demo.
 
 ## Deployment plan (egress + sustainability)
@@ -97,17 +97,22 @@ Two things to flag honestly:
 
 **Hosting**: A live Railway demo is running at
 `https://api-production-18d3.up.railway.app` under my account
-(env-var-driven; nothing repo-private). The MCP/Skill default to that URL but
-anyone can point at their own instance via `PAPERLISTS_API_URL`. If you'd rather
-it live on `papercopilot` infra (Railway, HF Spaces under `papercopilot` org,
-your own server), I'm happy to hand it over or co-administer — no strings attached.
+(env-var-driven; nothing repo-private). The MCP/Skill require
+`PAPERLISTS_API_URL`; examples can point at the demo, while a release should
+point at `papercopilot` infra (Railway, HF Spaces under `papercopilot` org, your
+own server, etc.). I'm happy to hand it over or co-administer — no strings attached.
 
 **Egress / cost control**:
 - `include_abstract` defaults to `false` on `/v1/search`; abstracts only go out through `/v1/paper/{conf}/{id}` (one-at-a-time).
 - Cross-worker token-bucket rate limiter at 60 req/min/IP (configurable),
   stored in a separate sqlite WAL DB so multi-worker deployments do not multiply
   the effective limit.
-- If traffic grows beyond the free tier, the same Dockerfile redeploys to **Cloudflare Workers + D1** (near-zero idle cost) or **HF Spaces** (free, ML-community-native). No code changes required, only the DB driver.
+- Broad analysis endpoints count matches before aggregating and fail closed with
+  `too_many_matches` above 50k rows; search pagination caps `offset` at 10k.
+- If traffic grows beyond the free tier, the same Dockerfile can redeploy to
+  container hosts such as **HF Spaces**. **Cloudflare Workers + D1** remains a
+  plausible near-zero-idle-cost future port, but it would be a port rather than
+  a DB-driver-only swap.
 
 ## What's intentionally NOT in this PR
 

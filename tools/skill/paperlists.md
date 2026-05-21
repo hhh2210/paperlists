@@ -2,7 +2,7 @@
 name: paperlists
 description: |
   Search and analyze how AI research has evolved over time, using the
-  papercopilot/paperlists corpus (237k+ papers across 30 conferences,
+  papercopilot/paperlists corpus (237k+ papers across 31 venues,
   2010-present). First-class verbs are trend-focused — topic_trend,
   topic_evolution, compare_periods, author_trajectory, field_landscape —
   not just keyword search. Backed by a hosted HTTPS API; no local data
@@ -44,7 +44,9 @@ Weak fit (other tools are better):
 ## How it works
 
 The skill is backed by a hosted HTTPS API at
-**`$PAPERLISTS_API_URL`** (default: `https://api-production-18d3.up.railway.app`).
+**`$PAPERLISTS_API_URL`**. For demo testing only, use
+`https://api-production-18d3.up.railway.app`; production releases should point
+at papercopilot-owned or self-hosted infrastructure.
 You can call it three ways:
 
 1. **MCP** — if `paperlists-mcp` is registered with your host, just use
@@ -98,6 +100,7 @@ egress — pass `include_abstract=true` only if you need the full text.
 - `search_papers` returns `{total_matches, returned, offset, limit, has_more, results, ...}`.
   Use `has_more` and `offset` to paginate; never assume `results` is exhaustive.
   (`total` is kept as a back-compat alias for one release; prefer `total_matches`.)
+  The hosted API caps `offset` at 10k to avoid expensive deep pagination.
 - `compare_periods` returns each period as `{years: [a, b], year_from, year_to, n_papers}`
   — both shapes are populated, pick whichever is more ergonomic.
 - `topic_evolution` adds `ranking_basis` to each window: `"gs_citation"` when
@@ -107,6 +110,8 @@ egress — pass `include_abstract=true` only if you need the full text.
 - Bad FTS5 input (unbalanced quotes, raw operators) returns HTTP 400 with
   `{error: "invalid_query"}`. The MCP/skill wrappers turn this into a normal
   result object so agents can retry with a cleaner query.
+- Overly broad analysis calls return HTTP 400 with `{error: "too_many_matches"}`.
+  Narrow the year range, venues, or query before retrying.
 
 ## Worked patterns
 

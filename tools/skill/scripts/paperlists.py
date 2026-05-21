@@ -26,7 +26,7 @@ Notes on `q=` queries:
     phrases), append `raw=true`. Bad raw queries return HTTP 400 with
     {"error":"invalid_query"}.
 
-Env: PAPERLISTS_API_URL (default https://api-production-18d3.up.railway.app)
+Env: PAPERLISTS_API_URL (required; demo https://api-production-18d3.up.railway.app)
 Dependencies: only stdlib (no requests/httpx required).
 """
 from __future__ import annotations
@@ -37,7 +37,8 @@ import sys
 import urllib.parse
 import urllib.request
 
-API_URL = os.environ.get("PAPERLISTS_API_URL", "https://api-production-18d3.up.railway.app").rstrip("/")
+DEMO_API_URL = "https://api-production-18d3.up.railway.app"
+API_URL = os.environ.get("PAPERLISTS_API_URL", "").rstrip("/")
 
 # Maps the CLI verb to (path_template, list_of_url_args).
 # Path args are pulled out of kwargs; the rest become querystring.
@@ -72,6 +73,13 @@ def main(argv: list[str]) -> int:
     verb = argv[1]
     if verb not in ENDPOINTS:
         print(f"unknown endpoint {verb!r}. Available: {', '.join(ENDPOINTS)}", file=sys.stderr)
+        return 2
+    if not API_URL:
+        print(
+            "PAPERLISTS_API_URL is required. For demo testing only, set "
+            f"PAPERLISTS_API_URL={DEMO_API_URL}",
+            file=sys.stderr,
+        )
         return 2
     path_tpl, path_args = ENDPOINTS[verb]
     kv = _parse_kv(argv[2:])

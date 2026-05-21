@@ -9,10 +9,11 @@ Three complementary entry points for working with the paperlists corpus:
 | [`mcp-server/`](mcp-server/) | MCP server for Claude Code / Cursor / Codex / Claude Desktop / any MCP host | You want AI agents to query the corpus directly |
 | [`skill/`](skill/) | Cross-tool Skill (`.md` + bundled CLI script) | You want zero-install access from any LLM that loads skills |
 
-The MCP server and Skill both default to the hosted API
-(`https://api-production-18d3.up.railway.app`), so end users don't need to
-download the ~830MB of raw JSON. Set `PAPERLISTS_API_URL` to point at a
-self-hosted instance.
+The MCP server and Skill use `PAPERLISTS_API_URL` to choose a backend. For
+demo testing, you can point them at the contributor-hosted Railway API
+(`https://api-production-18d3.up.railway.app`) without downloading the ~830MB
+of raw JSON. Production releases should point at papercopilot-owned or
+self-hosted infrastructure.
 
 # Paper Search Tool (legacy / local Streamlit)
 

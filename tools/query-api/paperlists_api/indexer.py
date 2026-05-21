@@ -306,6 +306,8 @@ def build_index(repo_root: Path, db_path: Path, *, force: bool = False) -> dict:
     conn.commit()
     conn.execute("ANALYZE")
     conn.execute("PRAGMA optimize")
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
     stats["elapsed_sec"] = round(time.time() - t0, 2)
     return stats

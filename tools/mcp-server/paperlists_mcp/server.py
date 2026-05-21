@@ -1,7 +1,9 @@
 """MCP server for the papercopilot/paperlists corpus.
 
-Defaults to talking to the hosted demo API; can be pointed at any deployment
-via PAPERLISTS_API_URL. Designed as a thin client so the same code works
+Talks to any paperlists API deployment via PAPERLISTS_API_URL. A contributor-
+hosted demo exists for evaluation, but the server does not silently default to
+it so upstream users do not send queries to non-papercopilot infrastructure by
+accident. Designed as a thin client so the same code works
 across Claude Code / Claude Desktop / Cursor / Codex / any MCP host.
 
 Run via stdio:
@@ -10,7 +12,7 @@ Run via stdio:
     python -m paperlists_mcp.server
 
 Env vars:
-    PAPERLISTS_API_URL   default: https://api-production-18d3.up.railway.app
+    PAPERLISTS_API_URL   required; demo: https://api-production-18d3.up.railway.app
     PAPERLISTS_TIMEOUT   default: 30 (seconds)
 """
 from __future__ import annotations
@@ -22,14 +24,26 @@ from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-API_URL = os.environ.get("PAPERLISTS_API_URL", "https://api-production-18d3.up.railway.app").rstrip("/")
+DEMO_API_URL = "https://api-production-18d3.up.railway.app"
+API_URL = os.environ.get("PAPERLISTS_API_URL", "").rstrip("/")
 TIMEOUT = float(os.environ.get("PAPERLISTS_TIMEOUT", "30"))
 
 mcp = FastMCP("paperlists")
-_client = httpx.Client(base_url=API_URL, timeout=TIMEOUT, headers={"User-Agent": "paperlists-mcp/0.1"})
+_client = (
+    httpx.Client(base_url=API_URL, timeout=TIMEOUT, headers={"User-Agent": "paperlists-mcp/0.1"})
+    if API_URL else None
+)
 
 
 def _get(path: str, **params) -> dict:
+    if _client is None:
+        return {
+            "error": "missing_api_url",
+            "detail": (
+                "Set PAPERLISTS_API_URL to a paperlists API deployment. "
+                f"For demo testing only, use {DEMO_API_URL}."
+            ),
+        }
     # Drop None params so they don't override defaults on the server side.
     clean = {k: v for k, v in params.items() if v is not None}
     try:

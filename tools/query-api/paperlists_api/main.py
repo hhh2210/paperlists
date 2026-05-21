@@ -18,11 +18,12 @@ from fastapi.responses import JSONResponse
 
 from . import __version__, queries, ratelimit
 from .db import DB_PATH, connect
-from .queries import FTSQueryError
+from .queries import FTSQueryError, TooManyMatchesError
 
 API_TITLE = "Paperlists Query API"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+MAX_OFFSET = 10_000
 
 app = FastAPI(
     title=API_TITLE,
@@ -50,6 +51,20 @@ async def _fts_query_error_handler(request: Request, exc: FTSQueryError):
         status_code=400,
     )
 
+
+@app.exception_handler(TooManyMatchesError)
+async def _too_many_matches_error_handler(request: Request, exc: TooManyMatchesError):
+    return JSONResponse(
+        {
+            "error": "too_many_matches",
+            "detail": str(exc),
+            "matches": exc.matches,
+            "max_matches": exc.max_matches,
+            "endpoint": exc.endpoint,
+        },
+        status_code=400,
+    )
+
 # ---------- Cross-worker rate limiter ----------
 # Backed by a tiny sqlite file (see paperlists_api/ratelimit.py). All
 # uvicorn workers see the same bucket for the same IP, so the per-IP quota
@@ -60,7 +75,8 @@ async def _fts_query_error_handler(request: Request, exc: FTSQueryError):
 #   "1"/"true"/"yes"   → always trust X-Forwarded-For
 #   "0"/"false"/"no"   → never trust XFF
 #   "auto" (default)   → trust if we detect a known trusted-proxy host
-#                        (Railway, HF Spaces). Avoids the failure mode where
+#                        (Railway, HF Spaces, Fly, Render, Vercel, Cloud Run,
+#                        Azure). Avoids the failure mode where
 #                        all users collapse into one bucket because the
 #                        operator forgot to set PAPERLISTS_TRUST_PROXY=1 on
 #                        a Railway deploy.
@@ -98,9 +114,13 @@ def _client_ip(req: Request) -> str:
     without `--forwarded-allow-ips=*`, so its default (trust 127.0.0.1
     only) keeps `req.client.host` honest. When `_TRUST_PROXY` is set
     (explicitly via env or auto-detected from a platform marker), we read
-    XFF and take the left-most entry as the original client.
+    Railway documents `X-Real-IP` as the client IP header; many other hosts
+    use XFF. Prefer `X-Real-IP`, then take the left-most XFF entry.
     """
     if _TRUST_PROXY:
+        real_ip = req.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip() or "unknown"
         fwd = req.headers.get("x-forwarded-for")
         if fwd:
             return fwd.split(",")[0].strip() or "unknown"
@@ -174,7 +194,7 @@ def search(
     year_to: Optional[int] = Query(None, ge=1990, le=2100),
     exclude_rejected: bool = Query(True),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET, description="Pagination offset. Capped to keep deep FTS pagination bounded."),
     order_by: str = Query("relevance", pattern="^(relevance|year_desc|citation_desc|rating_desc)$"),
     include_abstract: bool = Query(False, description="Include abstract in each result. Off by default to control egress."),
     raw: bool = Query(False, description=_RAW_DESC),

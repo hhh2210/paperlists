@@ -333,6 +333,31 @@ def test_raw_mode_classifies_known_fts5_parse_errors_as_400(tmp_path: Path, bad_
             queries.search_papers(conn, q=bad_raw_query, raw=True)
 
 
+def test_raw_mode_no_such_column_schema_errors_still_propagate(tmp_path: Path) -> None:
+    """`no such column` can come from FTS syntax or from real SQL drift. Dotted
+    SQL column names should not be relabelled as user-invalid FTS input."""
+    _write_json(
+        tmp_path / "iclr" / "iclr2025.json",
+        [{"id": "a", "title": "diffusion model", "status": "Poster"}],
+    )
+    db_path = tmp_path / "papers.db"
+    build_index(tmp_path, db_path, force=True)
+
+    with _connect(db_path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            queries._run_fts(
+                conn,
+                """
+                SELECT p.status_typo
+                FROM papers_fts
+                JOIN papers p ON p.id = papers_fts.rowid
+                WHERE papers_fts MATCH ?
+                """,
+                ["diffusion"],
+                raw=True,
+            )
+
+
 def test_proxy_auto_detection_covers_major_platforms(monkeypatch) -> None:
     """codex round-4 P3: auto-detect should fire for Railway, HF Spaces,
     Fly, Render, Vercel, Cloud Run, Azure App Service."""
@@ -361,6 +386,37 @@ def test_proxy_explicit_off_overrides_auto_detection(monkeypatch) -> None:
     monkeypatch.setenv("PAPERLISTS_TRUST_PROXY", "0")
     importlib.reload(m)
     assert not m._TRUST_PROXY
+
+
+def test_client_ip_prefers_x_real_ip_when_proxy_is_trusted(monkeypatch) -> None:
+    """Railway documents X-Real-IP as the client IP header; use it before XFF
+    when proxy trust is enabled."""
+    from types import SimpleNamespace
+    from paperlists_api import main as m
+
+    monkeypatch.setattr(m, "_TRUST_PROXY", True)
+    req = SimpleNamespace(
+        headers={
+            "x-real-ip": "203.0.113.8",
+            "x-forwarded-for": "198.51.100.9, 10.0.0.1",
+        },
+        client=SimpleNamespace(host="10.0.0.2"),
+    )
+    assert m._client_ip(req) == "203.0.113.8"
+
+    req.headers.pop("x-real-ip")
+    assert m._client_ip(req) == "198.51.100.9"
+
+    monkeypatch.setattr(m, "_TRUST_PROXY", False)
+    assert m._client_ip(req) == "10.0.0.2"
+
+
+def test_search_rejects_unbounded_offset_before_querying_db() -> None:
+    from fastapi.testclient import TestClient
+    from paperlists_api import main as m
+
+    resp = TestClient(m.app).get("/v1/search", params={"q": "model", "offset": m.MAX_OFFSET + 1})
+    assert resp.status_code == 422
 
 
 def test_server_errors_dont_masquerade_as_invalid_query(tmp_path: Path) -> None:
@@ -454,3 +510,38 @@ def test_top_papers_excludes_rejected_by_default(tmp_path: Path) -> None:
         )
         titles_raw = [r["title"] for r in out_raw["results"]]
         assert titles_raw == ["Rejected but cited", "Accepted poster"]
+
+
+def test_broad_analysis_queries_raise_too_many_matches(tmp_path: Path, monkeypatch) -> None:
+    """Broad aggregation endpoints should count first and fail closed instead
+    of materializing an unbounded match set in a Railway worker."""
+    _write_json(
+        tmp_path / "iclr" / "iclr2025.json",
+        [
+            {"id": f"p{i}", "title": f"learning paper {i}", "keywords": "learning", "status": "Poster"}
+            for i in range(3)
+        ],
+    )
+    db_path = tmp_path / "papers.db"
+    build_index(tmp_path, db_path, force=True)
+    monkeypatch.setattr(queries, "MAX_ANALYSIS_MATCHES", 2)
+
+    with _connect(db_path) as conn:
+        with pytest.raises(queries.TooManyMatchesError) as evolution_err:
+            queries.topic_evolution(conn, q="learning", year_from=2025, year_to=2025)
+        assert evolution_err.value.endpoint == "topic_evolution"
+        assert evolution_err.value.matches == 3
+        assert evolution_err.value.max_matches == 2
+
+        with pytest.raises(queries.TooManyMatchesError) as compare_err:
+            queries.compare_periods(
+                conn,
+                q="learning",
+                period_a=(2024, 2024),
+                period_b=(2025, 2025),
+            )
+        assert compare_err.value.endpoint == "compare_periods"
+
+        with pytest.raises(queries.TooManyMatchesError) as landscape_err:
+            queries.field_landscape(conn, q="learning", year=2025)
+        assert landscape_err.value.endpoint == "field_landscape"

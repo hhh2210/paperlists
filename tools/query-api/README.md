@@ -47,13 +47,13 @@ PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py topic_evo
 ## Deployment
 
 ### Railway
-- Live demo used by the MCP server and Skill defaults:
+- Contributor-hosted live demo for evaluation:
   `https://api-production-18d3.up.railway.app`.
 - Use `tools/query-api` as the Railway upload/build root.
 - The Docker build fetches the paperlists JSON corpus from GitHub inside Railway and builds `papers.db` there. This avoids uploading hundreds of MB of tracked JSON through `railway up`.
 - Railway reads `tools/query-api/railway.json` and uses `Dockerfile` from this directory.
 - Runtime defaults to **4 Uvicorn workers** (`WEB_CONCURRENCY=4`). The rate-limit state is sqlite-backed (`paperlists_api/ratelimit.py`, separate writable file at `/tmp/paperlists-ratelimit.db`) so all workers share one bucket per IP. No risk of `N×limit` bypass from sticky worker routing.
-- `PAPERLISTS_TRUST_PROXY` defaults to `"auto"`, which auto-enables XFF-trust whenever a known platform marker is present in the env (Railway / HF Spaces / Fly / Render / Vercel / Cloud Run / Azure App Service). Set it to `"1"` or `"0"` to override. On any host **not** in that list, set `PAPERLISTS_TRUST_PROXY=1` explicitly or every visitor will share one rate-limit bucket because `req.client.host` resolves to the proxy address. Uvicorn is **not** started with `--forwarded-allow-ips=*` — that flag would let uvicorn itself rewrite `request.client.host` from XFF *before* the middleware runs, defeating the trust gate.
+- `PAPERLISTS_TRUST_PROXY` defaults to `"auto"`, which auto-enables proxy-header trust whenever a known platform marker is present in the env (Railway / HF Spaces / Fly / Render / Vercel / Cloud Run / Azure App Service). Set it to `"1"` or `"0"` to override. On any host **not** in that list, set `PAPERLISTS_TRUST_PROXY=1` explicitly or every visitor will share one rate-limit bucket because `req.client.host` resolves to the proxy address. The app prefers `X-Real-IP` (Railway) and falls back to the left-most `X-Forwarded-For`. Uvicorn is **not** started with `--forwarded-allow-ips=*` — that flag would let uvicorn itself rewrite `request.client.host` from XFF *before* the middleware runs, defeating the trust gate.
 - Current Railway build indexed 237,735 papers from 292 source files into a
   ~623 MB sqlite DB.
 - Free hobby tier (~$5/mo credit) is sufficient for the demo.
@@ -61,6 +61,10 @@ PAPERLISTS_API_URL=http://127.0.0.1:8000 python3 scripts/paperlists.py topic_evo
   1. `include_abstract` defaults to `false` on `/v1/search` — abstracts are only sent on `/v1/paper/{conf}/{id}`.
   2. Token-bucket rate limiter (default 60 req/min/IP, burst 20). Tune via `PAPERLISTS_RATE_PER_MIN`, `PAPERLISTS_RATE_BURST`. Bucket size capped at 10k rows with 30 min stale eviction (`PAPERLISTS_RATE_BUCKET_MAX`, `PAPERLISTS_RATE_STALE_SEC`). GC sweeps run probabilistically (~1% of requests).
   3. Response field whitelist on cards — large fields like `bibtex`, `reviewers`, `or_profile` are never returned.
+- Broad analysis endpoints (`topic_evolution`, `compare_periods`, and
+  `field_landscape`) count matches before in-memory aggregation and return
+  `400 {"error":"too_many_matches"}` above 50k rows. `/v1/search` caps
+  `offset` at 10k to keep deep pagination from tying up workers.
 
 ### HF Spaces / Fly.io / self-hosted
 Same Dockerfile, just point at a different host. The index step is the slow part (~1–2 min on cold build).

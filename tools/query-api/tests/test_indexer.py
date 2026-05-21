@@ -70,3 +70,16 @@ def test_build_index_tries_stable_alternate_ids_before_dedup_hash(tmp_path: Path
         "10.1145/second",
         "https://openreview.net/forum?id=third",
     ]
+
+
+def test_build_index_checkpoints_wal_before_close(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "iclr" / "iclr2025.json",
+        [{"id": "a", "title": "A", "keywords": "reasoning"}],
+    )
+
+    db_path = tmp_path / "papers.db"
+    build_index(tmp_path, db_path, force=True)
+
+    wal_path = Path(f"{db_path}-wal")
+    assert not wal_path.exists() or wal_path.stat().st_size == 0
